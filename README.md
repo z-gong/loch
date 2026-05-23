@@ -42,7 +42,7 @@ pip install -e .
 
 ```bash
 loch gcmc -p top.psf -c conf.gro -f primitive.zff \
-    --resname ETOL --mu -25.4 --vol 0.0946 --nghost 50 \
+    --resname ETOH --mu -25.4 --vol 0.0946 --nghost 50 \
     --cycle 500 -n 1000 -t 300 --nattempt 10000 --batch 1000
 ```
 
@@ -67,7 +67,7 @@ system = System(top, ff)
 # Create sampler.
 sampler = GCMCSampler(
     system,
-    residue_name='ETOL',
+    residue_name='ETOH',
     excess_chemical_potential=-25.4,  # kJ/mol, from mstk sfe
     standard_volume=0.0946,           # nm^3, molecular volume from NPT
     temperature=300,                  # K

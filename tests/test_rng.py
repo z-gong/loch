@@ -11,11 +11,13 @@ class TestBatchRandoms:
         """Test that BatchRandoms has the expected fields."""
         batch = BatchRandoms(
             rotation=np.zeros((10, 3)),
+            direction=np.zeros((10, 3)),
             position=np.zeros((10, 3)),
             radius=np.zeros(10),
             acceptance=np.zeros(10),
         )
         assert hasattr(batch, "rotation")
+        assert hasattr(batch, "direction")
         assert hasattr(batch, "position")
         assert hasattr(batch, "radius")
         assert hasattr(batch, "acceptance")
@@ -73,7 +75,7 @@ class TestRNGManager:
         samples = []
         for _ in range(10):
             batch = rng.get_batch_randoms()
-            samples.append(batch.position.flatten())
+            samples.append(batch.direction.flatten())
 
         all_samples = np.concatenate(samples)
 
