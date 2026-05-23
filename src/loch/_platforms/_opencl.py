@@ -36,7 +36,7 @@ from .._kernels import code as _kernel_code
 from ._base import PlatformBackend as _PlatformBackend
 
 # Module-level kernel compilation cache. Keyed on
-# (device_index, compiler_optimisations). Stores compiled program binaries.
+# (device_index, compiler_optimisations, num_points). Stores compiled program binaries.
 _kernel_cache = {}
 
 
@@ -136,10 +136,10 @@ class OpenCLPlatform(_PlatformBackend):
         dict
             Dictionary mapping kernel names to callable kernel functions.
         """
-        cache_key = (self._device_index, self._compiler_optimisations)
+        cache_key = (self._device_index, self._compiler_optimisations, self._num_points)
 
         # Build compiler options
-        build_options = []
+        build_options = [f"-DMAX_POINTS={self._num_points}"]
         if self._compiler_optimisations:
             build_options.extend(["-cl-mad-enable", "-cl-no-signed-zeros"])
 

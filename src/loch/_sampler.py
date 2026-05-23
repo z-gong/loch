@@ -1,5 +1,5 @@
 ######################################################################
-# Loch: GPU accelerated GCMC water sampling engine.
+# Loch: GPU accelerated GCMC sampling engine.
 #
 # Copyright: 2025-2026
 #
@@ -21,624 +21,274 @@
 
 __all__ = ["GCMCSampler"]
 
-from typing import Any as _Any, Optional as _Optional, Union as _Union
+from typing import Optional as _Optional, Union as _Union
 
 import numpy as _np
 import openmm as _openmm
 import os as _os
 
-try:
-    from somd2 import _logger
-except Exception:
-    from loguru import logger as _logger
+from mstk import logger as _logger
 
-import BioSimSpace as _BSS
-import sire as _sr
+from mstk.simsys import System as _MstkSystem
+from mstk.topology import Topology as _MstkTopology
+from mstk.forcefield import ForceField as _ForceField
+from mstk.forcefield import LJ126Term as _LJ126Term
 
 from ._platforms import create_backend as _create_backend
 from ._platforms._rng import RNGManager as _RNGManager
-from ._softcore import SoftcoreForm as _SoftcoreForm
 
 
 def _as_float32(arr: _np.ndarray) -> _np.ndarray:
-    """Convert array to float32 only if not already float32."""
     return arr if arr.dtype == _np.float32 else arr.astype(_np.float32)
 
 
 def _as_int32(arr: _np.ndarray) -> _np.ndarray:
-    """Convert array to int32 only if not already int32."""
     return arr if arr.dtype == _np.int32 else arr.astype(_np.int32)
+
+
+# Boltzmann constant in kJ/(mol*K)
+_KB_KJMOL = 0.008314462618
 
 
 class GCMCSampler:
     """
-    A class to perform GCMC water sampling on the GPU.
+    GPU-accelerated Grand Canonical Monte Carlo sampler.
+
+    Attributes (read-only)
+    ----------------------
+    topology : mstk.Topology
+        Extended topology (real + ghost molecules) with positions.
+    omm_system : openmm.System
+        OpenMM system with ghost nonbonded parameters zeroed.
+    water_state : np.ndarray
+        Per-molecule state: 0=ghost, 1=real.
+    water_indices : np.ndarray
+        First-atom OpenMM index for each GCMC molecule.
+    box_size : np.ndarray
+        Current box dimensions in nm (shape (3,)).
+    num_insertions : int
+        Cumulative accepted insertions.
+    num_deletions : int
+        Cumulative accepted deletions.
+    ghost_exhausted : bool
+        True if no ghost slots remain for insertion.
     """
 
     def __init__(
         self,
-        system: _Any,
-        reference: _Optional[str] = None,
-        radius: str = "4.0 A",
-        cutoff_type: str = "pme",
-        cutoff: str = "10.0 A",
-        excess_chemical_potential: str = "-6.09 kcal/mol",
-        standard_volume: str = "30.543 A^3",
-        temperature: str = "298 K",
-        adams_shift: _Union[int, float] = 0.0,
+        system: _MstkSystem,
+        residue_name: str,
+        ghost_existing: bool = False,
+        reference: _Optional[list] = None,
+        radius: float = 0.4,
+        is_pme: bool = True,
+        excess_chemical_potential: float = -25.5,
+        standard_volume: float = 0.030543,
+        temperature: float = 298.0,
+        adams_shift: float = 0.0,
         num_ghost_waters: int = 20,
         batch_size: int = 1000,
         num_attempts: int = 10000,
         num_threads: int = 1024,
         bulk_sampling_probability: float = 0.1,
-        water_template: _Optional[_Any] = None,
+        insert_only: bool = False,
         device: _Optional[int] = None,
         platform: str = "auto",
         tolerance: float = 0.0,
-        lambda_schedule: _Optional[_Any] = None,
-        lambda_value: float = 0.0,
-        rest2_scale: float = 1.0,
-        rest2_selection: _Optional[str] = None,
-        shift_coulomb: str = "1 A",
-        shift_delta: str = "1.5 A",
-        softcore_form: str = "zacharias",
-        taylor_power: int = 1,
-        beutler_alpha: float = 0.5,
-        swap_end_states: bool = False,
-        restart: bool = False,
-        overwrite: bool = False,
-        ghost_file: _Optional[str] = "ghosts.txt",
-        log_file: _Optional[str] = "gcmc.txt",
-        log_level: str = "error",
         seed: _Optional[int] = None,
         nvcc: _Optional[str] = None,
         compiler_optimisations: bool = True,
-        **kwargs: _Any,
     ) -> None:
         """
-        Initialise the GCMC sampler.
-
         Parameters
         ----------
-
-        system: sire.system.System
-            The molecular system.
-
-        reference: str
-            A selection string for the reference atoms. If None, then waters
-            will be randomly inserted or deleted within the simulation box.
-
-        radius: str
-            The radius of the GCMC sphere.
-
-        cutoff_type: str
-            The type of cutoff to use: "pme" or "rf".
-
-        cutoff: str
-            The cutoff distance for the non-bonded interactions.
-
-        excess_chemical_potential: str
-            The excess chemical potential.
-
-        standard_volume: str
-            The standard volume of water.
-
-        temperature: str
-            The temperature of the system.
-
-        adams_shift: float
-            The Adams shift.
-
-        num_ghost_waters: int
-            The initial number of ghost waters to add to the system. These are
-            used for GCMC insertion moves, so no more insertions can be made
-            once they are exhausted.
-
-        batch_size: int
-            The number of random insertions and deletion trials per batch.
-            This should be tuned according to the attempt acceptance
-            probability i.e. aim to accept an average of 1 move per batch
-            to avoid wasted computation.
-
-        num_attempts: int
-            The total number of attempts per move. In each batch, the lowest
-            candidate index of the first accepted state will be used to
-            determine the number of attempts, i.e. we will only accept
-            the first accepted state. This must be greater than or equal
-            to the batch size.
-
-        num_threads: int
-            The number of threads per block. (Must be a multiple of 32.)
-
-        bulk_sampling_probability: float
-            The probability of perforing trial insertion and deletion
-            moves within the entire simulation box, rather than within
-            the GCMC sphere. This option is only relevant when 'reference'
-            is not None.
-
-        water_template: sire.molecule.Molecule
-            A water molecule to use as a template. This is only required when
-            the system does not contain any water molecules. If provided, water
-            parameters for the GCMC insertion and deletion trials will be taken
-            from the template.
-
-        device: int
-            The GPU device index. (This is the index in the list of visible
-            devices.)
-
-        platform: str
-            The GPU platform to use. Options are 'auto' (default), 'cuda',
-            or 'opencl'. When 'auto', CUDA will be preferred if available,
-            falling back to OpenCL.
-
-        tolerance: float
-            The tolerance for the acceptance probability, i.e. the minimum
-            probability of acceptance for a move. This can be used to exclude
-            low probability candidates that can cause instabilities or crashes
-            for the MD engine.
-
-        lambda_schedule: sire.cas.LambdaSchedule
-            The lambda schedule if the passed system is an alchemical system.
-
-        lambda_value: float
-            The lambda value if the passed system is an alchemical system.
-
-        rest2_scale: float
-            The scaling factor if using Replica Exchange with Solute Tempering
-            (REST2) for alchemical systems. This should specify the temperature
-            of the REST2 system relative to the rest of the system.
-
-        rest2_selection: str
-            A selection string for atoms to include in the REST2 region in
-            addition to any perturbable molecules. For example, "molidx 0 and
-            residx 0,1,2" would select atoms from the first three residues of the
-            first molecule. If None, then all atoms within perturbable molecules
-            will be included in the REST2 region. When atoms within a perturbable
-            molecule are included in the selection, then only those atoms will be
-            considered as part of the REST2 region. This allows REST2 to be applied
-            to protein mutations.
-
-        couloumb_power : float
-            Power to use for the soft-core Coulomb interaction. This is used
-            to soften the electrostatic interaction.
-
-        shift_coulomb : str
-            The soft-core shift-coulomb parameter. This is used to soften the
-            Coulomb interaction.
-
-        shift_delta : str
-            The soft-core shift-delta parameter. This is used to soften the
-            Lennard-Jones interaction.
-
-        softcore_form : str
-            The soft-core potential form to use for alchemical interactions.
-            Valid options are 'zacharias' (default), 'taylor', and 'beutler'.
-            The Beutler form is recommended for ABFE calculations.
-
-        taylor_power : int
-            The power to use for the alpha term in the Taylor soft-core LJ
-            expression, i.e. sig6 = sigma^6 / (alpha^m * sigma^6 + r^6).
-            Must be between 0 and 4. The default is 1. Only used when
-            softcore_form is 'taylor'.
-
-        beutler_alpha : float
-            The dimensionless scale factor for the r^6 shift in the Beutler
-            soft-core form. Must be >= 0. The default is 0.5. Only used when
-            softcore_form is 'beutler'.
-
-        swap_end_states: bool
-            Whether to swap the end states of the alchemical systems.
-
-        restart: bool
-            Whether this is a restart simulation. If True, then data will
-            be appended to existing log files.
-
-        overwrite: bool
-            Overwrite existing log files.
-
-        dcd_file: str
-            The file to write the GCMC trajectory to.
-
-        ghost_file: str
-            The file to write the ghost residue indices to.
-
-        log_level: str
-            The logging level.
-
-        seed: int
-            The seed for the random number generator.
-
-        nvcc: str
-            The path to the nvcc compiler. If None, the default nvcc
-            in the PATH will be used.
-
-        compiler_optimisations: bool
-            Enable compiler optimisations for faster math operations.
-            When True, passes --use_fast_math to CUDA (nvcc) and
-            -cl-mad-enable -cl-no-signed-zeros to OpenCL.
-            Default: True (matches OpenMM defaults).
+        system : mstk.simsys.System
+            The molecular system (topology + force field). Must contain at
+            least one molecule with matching residue_name.
+        residue_name : str
+            Residue name of the molecule to insert/delete.
+        ghost_existing : bool
+            If True, all pre-existing molecules matching residue_name start
+            as ghosts (non-interacting). Use for dry systems where a template
+            molecule was added to the topology just to complete the force field.
+        reference : list of int, optional
+            Atom indices defining the GCMC sphere center. If None,
+            insertions/deletions occur in the whole box.
+        radius : float
+            GCMC sphere radius in nm.
+        is_pme : bool
+            Use PME for electrostatics. If False, use reaction field.
+        excess_chemical_potential : float
+            Excess chemical potential in kJ/mol.
+        standard_volume : float
+            Standard molar volume of the molecule in nm^3.
+        temperature : float
+            Temperature in K.
+        adams_shift : float
+            Shift applied to the Adams parameter.
+        num_ghost_waters : int
+            Number of ghost molecules to pre-allocate.
+        batch_size : int
+            Number of trial moves per GPU batch.
+        num_attempts : int
+            Total attempts per move() call.
+        num_threads : int
+            GPU threads per block (multiple of 32).
+        bulk_sampling_probability : float
+            Probability of sampling in the full box instead of the sphere.
+        device : int, optional
+            GPU device index.
+        platform : str
+            "auto", "cuda", or "opencl".
+        tolerance : float
+            Minimum acceptance probability threshold.
         """
 
-        # Validate the input.
+        # Validate system input.
+        if not isinstance(system, _MstkSystem):
+            raise TypeError("'system' must be of type 'mstk.simsys.System'")
+        self._system = system
+        self._topology = system.topology
+        self._ff = system.ff
 
-        if not isinstance(system, _sr.system.System):
-            raise ValueError("'system' must be of type 'sire.system.System'")
-        self._system = system.clone()
-
-        # Check whether this is an alchemical system.
-        try:
-            if len(self._system["property is_perturbable"].molecules()) > 0:
-                self._is_fep = True
-                self._system = _sr.morph.link_to_reference(self._system)
-            else:
-                self._is_fep = False
-        except Exception:
-            self._is_fep = False
-
-        if reference is not None:
-            if not isinstance(reference, str):
-                raise ValueError("'reference' must be of type 'str'")
-        self._reference = reference
-
-        if not isinstance(cutoff_type, str):
-            raise ValueError("'cutoff_type' must be of type 'str'")
-        cutoff_type = cutoff_type.lower().replace(" ", "")
-        if cutoff_type not in ["rf", "pme"]:
-            raise ValueError("The cutoff type must be 'rf' or 'pme'.")
-        self._cutoff_type = cutoff_type
-
-        if self._cutoff_type == "pme":
-            self._is_pme = True
+        # Detect combining rule from force field.
+        if self._ff.lj_mixing_rule == _ForceField.LJ_MIXING_LB:
+            self._combining_rule = 0  # arithmetic sigma
+        elif self._ff.lj_mixing_rule == _ForceField.LJ_MIXING_GEOMETRIC:
+            self._combining_rule = 1  # geometric sigma
         else:
-            self._is_pme = False
-
-        # LRC state: initialised lazily on first move() call.
-        self._has_gcmc_lrc = False
-        self._lrc_w_solute = 0.0
-        self._lrc_ww_half = 0.0
-
-        try:
-            self._radius = self._validate_sire_unit("radius", radius, _sr.u("A"))
-        except Exception as e:
-            raise ValueError(f"Could not validate the 'radius': {e}")
-
-        try:
-            self._cutoff = self._validate_sire_unit("cutoff", cutoff, _sr.u("A"))
-        except Exception as e:
-            raise ValueError(f"Could not validate the 'cutoff': {e}")
-
-        try:
-            self._excess_chemical_potential = self._validate_sire_unit(
-                "excess_chemical_potential",
-                excess_chemical_potential,
-                _sr.u("kcal/mol"),
+            raise ValueError(
+                "Unsupported LJ mixing rule. Must be Lorentz-Berthelot or geometric."
             )
-        except Exception as e:
-            raise ValueError(f"Could not validate the 'excess_chemical_potential': {e}")
 
-        try:
-            self._standard_volume = self._validate_sire_unit(
-                "standard_volume", standard_volume, _sr.u("A^3")
+        # Guard: check FF compatibility with GCMC kernel assumptions.
+        unsupported_vdw = self._ff.vdw_term_classes - {_LJ126Term}
+        if unsupported_vdw:
+            raise ValueError(
+                f"Unsupported VdW term classes: "
+                f"{', '.join(c.__name__ for c in unsupported_vdw)}. "
+                f"GCMC kernel only supports LJ126Term."
             )
-        except Exception as e:
-            raise ValueError(f"Could not validate the 'standard_volume': {e}")
-
-        try:
-            self._temperature = self._validate_sire_unit(
-                "temperature", temperature, _sr.u("K")
+        if self._ff.pairwise_vdw_terms:
+            raise ValueError(
+                "Force field contains explicit pairwise VdW terms. "
+                "GCMC kernel uses per-atom sigma/epsilon with mixing rules "
+                "and cannot reproduce explicit pair parameters."
             )
-        except Exception as e:
-            raise ValueError(f"Could not validate the 'temperature': {e}")
+        if self._ff.vdw_long_range == _ForceField.VDW_LONGRANGE_SHIFT:
+            raise ValueError(
+                "vdw_long_range='shift' is not supported. "
+                "GCMC kernel uses unshifted LJ potential."
+            )
+        if self._ff.is_polarizable:
+            raise ValueError(
+                "Polarizable force fields (Drude) are not supported. "
+                "GCMC kernel computes fixed-charge pairwise energy only."
+            )
+        if self._ff.has_virtual_site:
+            raise ValueError(
+                "Virtual site force fields (e.g. TIP4P) are not supported."
+            )
 
-        if not isinstance(num_ghost_waters, int):
-            raise ValueError("'num_ghost_waters' must be of type 'int'")
-        self._num_ghost_waters = num_ghost_waters
+        self._residue_name = residue_name
 
-        if not isinstance(adams_shift, (int, float)):
-            raise ValueError("'adams_shift' must be of type 'int' or 'float'")
+        # Reference atoms for GCMC sphere.
+        if reference is not None:
+            if not isinstance(reference, (list, _np.ndarray)):
+                raise TypeError("'reference' must be a list of int")
+            self._reference_indices = _np.asarray(reference, dtype=_np.int32)
+        else:
+            self._reference_indices = None
+
+        self._is_pme = bool(is_pme)
+
+        # Store physical parameters (all in nm / kJ/mol / K).
+        self._radius = float(radius)
+        self._cutoff = float(self._ff.vdw_cutoff)
+        self._excess_chemical_potential = float(excess_chemical_potential)
+        self._standard_volume = float(standard_volume)
+        self._temperature = float(temperature)
         self._adams_shift = float(adams_shift)
 
-        if not isinstance(batch_size, int):
-            raise ValueError("'batch_size' must be of type 'int'")
-        if batch_size <= 0:
-            raise ValueError("'batch_size' must be greater than 0")
+        # Validate integer parameters.
+        if not isinstance(num_ghost_waters, int) or num_ghost_waters <= 0:
+            raise ValueError("'num_ghost_waters' must be a positive int")
+        self._num_ghost_waters = num_ghost_waters
+
+        if not isinstance(batch_size, int) or batch_size <= 0:
+            raise ValueError("'batch_size' must be a positive int")
         self._batch_size = batch_size
 
-        if not isinstance(num_attempts, int):
-            raise ValueError("'num_attempts' must be of type 'int'")
-        if num_attempts <= 0:
-            raise ValueError("'num_attempts' must be greater than 0")
+        if not isinstance(num_attempts, int) or num_attempts <= 0:
+            raise ValueError("'num_attempts' must be a positive int")
         if num_attempts < batch_size:
-            raise ValueError(
-                "'num_attempts' must be greater than or equal to 'batch_size'"
-            )
+            raise ValueError("'num_attempts' must be >= 'batch_size'")
         self._num_attempts = num_attempts
 
-        if not isinstance(num_threads, int):
-            raise ValueError("'num_threads' must be of type 'int'")
-        if not num_threads % 32 == 0:
-            raise ValueError("'num_threads' must be a multiple of 32")
+        if not isinstance(num_threads, int) or num_threads % 32 != 0:
+            raise ValueError("'num_threads' must be a positive multiple of 32")
         self._num_threads = num_threads
 
-        self.set_bulk_sampling_probability(bulk_sampling_probability)
+        self._bulk_sampling_probability = float(bulk_sampling_probability)
+        if not 0.0 <= self._bulk_sampling_probability <= 1.0:
+            raise ValueError("'bulk_sampling_probability' must be between 0 and 1")
 
-        if not isinstance(overwrite, bool):
-            raise ValueError("'overwrite' must be of type 'bool'")
-        self._overwrite = overwrite
+        self._insert_only = bool(insert_only)
+        self._ghost_existing = bool(ghost_existing)
 
-        if not isinstance(restart, bool):
-            raise ValueError("'restart' must be of type 'bool'")
-        self._restart = restart
+        self._tolerance = float(tolerance)
 
-        if ghost_file is not None:
-            if not isinstance(ghost_file, str):
-                raise ValueError("'ghost_file' must be of type 'str'")
-            self._ghost_file = ghost_file
-            if not isinstance(ghost_file, str):
-                raise ValueError("'ghost_file' must be of type 'str'")
-            self._ghost_file = ghost_file
-
-            if _os.path.exists(self._ghost_file):
-                if not self._restart and not self._overwrite:
-                    raise ValueError(
-                        "'ghost_file' already exists. Use 'overwrite=True' to overwrite it."
-                    )
-                else:
-                    with open(self._ghost_file, "w") as f:
-                        f.write("")
-        else:
-            self._ghost_file = None
-
-        if log_file is not None:
-            if not isinstance(log_file, str):
-                raise ValueError("'log_file' must be of type 'str'")
-            self._log_file = log_file
-            if _os.path.exists(self._log_file):
-                if not self._overwrite:
-                    raise ValueError(
-                        "'log_file' already exists. Use 'overwrite=True' to overwrite it."
-                    )
-                else:
-                    with open(self._log_file, "w") as f:
-                        f.write("")
-        else:
-            self._log_file = None
-
-        if not isinstance(log_level, str):
-            raise ValueError("'log_level' must be of type 'str'")
-        log_level = log_level.lower().replace(" ", "")
-        allowed_levels = [level.lower() for level in _logger._core.levels]
-        if log_level not in allowed_levels:
-            raise ValueError(
-                f"Invalid 'log_level': {log_level}. Choices are: {', '.join(allowed_levels)}"
-            )
-        self._log_level = log_level
-        if self._log_level == "debug":
-            self._is_debug = True
-        else:
-            self._is_debug = False
-
-        if seed is not None:
-            if not isinstance(seed, int):
-                raise ValueError("'seed' must be of type 'int'")
-        else:
+        # Seed.
+        if seed is None:
             seed = _np.random.randint(_np.iinfo(_np.int32).max)
         self._seed = seed
+        _np.random.seed(seed)
+        self._rng = _np.random.default_rng(seed)
 
-        # Set the seed.
-        _np.random.seed(self._seed)
-
-        # Create a random number generator.
-        self._rng = _np.random.default_rng(self._seed)
-
-        # Validate nvcc path if provided
+        # NVCC path.
         if nvcc is not None:
-            if not isinstance(nvcc, str):
-                raise ValueError("'nvcc' must be of type 'str'")
             if not _os.path.exists(nvcc):
-                raise ValueError(f"'nvcc' does not exist: {nvcc}")
+                raise ValueError(f"'nvcc' path does not exist: {nvcc}")
         else:
             from shutil import which
-
             nvcc = _os.environ.get("PYCUDA_NVCC", which("nvcc"))
         self._nvcc = nvcc
 
-        # Set the tolerance.
-        try:
-            self._tolerance = float(tolerance)
-        except Exception as e:
-            raise ValueError(f"Could not convert 'tolerance' to float: {e}")
-
-        # Check for alchemical properties.
-        if lambda_schedule is not None:
-            if not isinstance(lambda_schedule, _sr.cas.LambdaSchedule):
-                raise ValueError(
-                    "'lambda_schedule' must be of type 'sire.cas.LambdaSchedule'"
-                )
-            self._lambda_schedule = lambda_schedule
-        else:
-            if self._is_fep:
-                raise ValueError(
-                    "'lambda_schedule' must be provided for alchemical systems"
-                )
-            self._lambda_schedule = None
-
-        try:
-            lambda_value = float(lambda_value)
-        except Exception:
-            raise ValueError("'lambda_value' must be of type 'float'")
-        if not 0.0 <= lambda_value <= 1.0:
-            raise ValueError("'lambda_value' must be between 0 and 1")
-        self._lambda_value = float(lambda_value)
-
-        try:
-            rest2_scale = float(rest2_scale)
-        except Exception:
-            raise ValueError("'rest2_scale' must be of type 'float'")
-        if rest2_scale < 1.0:
-            raise ValueError("'rest2_scale' must be greater than or equal to 1.0")
-        self._rest2_scale = rest2_scale
-
-        if rest2_selection is not None:
-            if not isinstance(rest2_selection, str):
-                raise ValueError("'rest2_selection' must be of type 'str'")
-
-            from sire.mol import selection_to_atoms
-
-            try:
-                atoms = selection_to_atoms(self._system, rest2_selection)
-            except Exception:
-                msg = "Invalid 'rest2_selection' value."
-                _logger.error(msg)
-                raise ValueError(msg)
-
-            # Make sure the user hasn't selected all atoms.
-            if len(atoms) == self._system.num_atoms():
-                raise ValueError(
-                    "'rest2_selection' cannot contain all atoms in the system."
-                )
-        self._rest2_selection = rest2_selection
-
-        try:
-            self._shift_coulomb = self._validate_sire_unit(
-                "shift_coulomb", shift_coulomb, _sr.u("A")
-            )
-        except Exception as e:
-            raise ValueError(f"Could not validate the 'shift_coulomb': {e}")
-
-        try:
-            self._shift_delta = self._validate_sire_unit(
-                "shift_delta", shift_delta, _sr.u("A")
-            )
-        except Exception as e:
-            raise ValueError(f"Could not validate the 'shift_delta': {e}")
-
-        if not isinstance(softcore_form, str):
-            raise TypeError("'softcore_form' must be of type 'str'")
-        softcore_form = softcore_form.lower().replace(" ", "")
-        _valid_softcore_forms = {m.name.lower(): m for m in _SoftcoreForm}
-        if softcore_form not in _valid_softcore_forms:
-            raise ValueError(
-                f"'softcore_form' not recognised. Valid forms are: "
-                f"{', '.join(_valid_softcore_forms)}"
-            )
-        self._softcore_form = _valid_softcore_forms[softcore_form]
-
-        if not isinstance(taylor_power, int):
-            try:
-                taylor_power = int(taylor_power)
-            except Exception:
-                raise ValueError("'taylor_power' must be of type 'int'")
-        if not 0 <= taylor_power <= 4:
-            raise ValueError("'taylor_power' must be between 0 and 4")
-        self._taylor_power = taylor_power
-
-        try:
-            beutler_alpha = float(beutler_alpha)
-        except Exception:
-            raise ValueError("'beutler_alpha' must be of type 'float'")
-        if beutler_alpha < 0.0:
-            raise ValueError("'beutler_alpha' must be >= 0")
-        self._beutler_alpha = beutler_alpha
-
-        if not isinstance(swap_end_states, bool):
-            raise ValueError("'swap_end_states' must be of type 'bool'")
-        self._swap_end_states = swap_end_states
-
-        if swap_end_states and self._lambda_schedule is not None:
-            self._lambda_schedule = self._lambda_schedule.reverse()
-
-        # Check for waters and validate the template.
-        try:
-            self._water_template = system["water and not property is_perturbable"][0]
-        except Exception:
-            if water_template is None:
-                raise ValueError(
-                    "The system does not contain any water molecules. "
-                    "Please provide a water template."
-                )
-            else:
-                if not isinstance(water_template, _sr.molecule.Molecule):
-                    raise ValueError(
-                        "'water_template' must be of type 'sire.mol.Molecule'"
-                    )
-            self._water_template = water_template
-        self._num_points = self._water_template.num_atoms()
-
-        # Get the indices of the reference atoms.
-        if self._reference is not None:
-            self._reference_indices = self._get_reference_indices(system, reference)
-
-        # Prepare the system for GCMC sampling.
-        try:
-            self._system, self._water_indices, self._water_residues = (
-                self._prepare_system(
-                    system, self._water_template, self._rng, self._num_ghost_waters
-                )
-            )
-            self._num_atoms = self._system.num_atoms()
-            self._num_waters = len(self._water_indices)
-        except Exception as e:
-            raise ValueError(f"Could not prepare the system for GCMC sampling: {e}")
-
-        # Compute per-molecule virtual site information. Virtual sites are
-        # appended after the real atoms of each molecule in the OpenMM system,
-        # so all subsequent molecules have their OpenMM particle indices shifted
-        # by the cumulative number of virtual sites in preceding molecules.
-        (
-            self._total_vsites,
-            self._vsite_atom_offsets,
-            self._mol_vsite_charges,
-        ) = self._get_vsite_offsets(self._system)
-
-        # Keep a copy of the Sire atom indices before applying the OpenMM
-        # offset. These are needed by any operation that works on the Sire
-        # topology (e.g. _flag_ghost_waters, ghost_residues), which has no
-        # knowledge of virtual site particles.
-        self._water_indices_sire = self._water_indices.copy()
-
-        if self._total_vsites > 0:
-            # Offset water oxygen indices from Sire atom indices to OpenMM
-            # particle indices.
-            self._water_indices = (
-                self._water_indices + self._vsite_atom_offsets[self._water_indices]
-            )
-
-            # Apply the same correction to the reference atom indices.
-            if self._reference is not None:
-                self._reference_indices = (
-                    self._reference_indices
-                    + self._vsite_atom_offsets[self._reference_indices]
-                )
-
-        # Update the total atom count to include virtual site particles.
-        self._num_atoms = self._system.num_atoms() + self._total_vsites
-
-        # Validate the platform parameter.
-        valid_platforms = {"auto", "cuda", "opencl"}
-
-        if not isinstance(platform, str):
-            raise TypeError("'platform' mut be of type 'str'.")
-
-        # Convert to lower case and strip whitespace.
-        platform = platform.lower().replace(" ", "")
-
-        if platform not in valid_platforms:
-            raise ValueError(
-                f"Invalid platform '{platform}'. Must be one of {valid_platforms}."
-            )
-        self._platform = platform
-
-        if device is not None:
-            if not isinstance(device, int):
-                raise ValueError("'device' must be of type 'int'")
-        self._device = device
-
-        if not isinstance(compiler_optimisations, bool):
-            raise ValueError("'compiler_optimisations' must be of type 'bool'")
         self._compiler_optimisations = compiler_optimisations
 
-        # Create platform backend
+        # Attributes set by _prepare_system().
+        self._num_points = 0
+        self._water_charge = None
+        self._water_sigma = None
+        self._water_epsilon = None
+        self._template_type_indices = None
+        self._use_lrc = False
+        self._lrc_w_solute = 0.0
+        self._lrc_ww_half = 0.0
+        self._nonbonded_force = None
+        self._custom_nb_forces = []
+        self._ghost_type_index = None
+        self._water_indices = None
+        self._num_waters = 0
+        self._num_atoms = 0
+        self._extended_system = None
+        self.omm_system = None
+        self.topology = None
+
+        # --- Prepare system: find molecules, add ghosts ---
+        self._prepare_system()
+
+        # --- Platform and GPU backend ---
+        valid_platforms = {"auto", "cuda", "opencl"}
+        platform = platform.lower().strip()
+        if platform not in valid_platforms:
+            raise ValueError(f"Invalid platform '{platform}'. Must be one of {valid_platforms}.")
+        self._platform = platform
+
+        if device is not None and not isinstance(device, int):
+            raise ValueError("'device' must be of type 'int'")
+        self._device = device
+
         self._backend = _create_backend(
             platform=self._platform,
             device=self._device if self._device is not None else 0,
@@ -651,165 +301,102 @@ class GCMCSampler:
             compiler_optimisations=self._compiler_optimisations,
         )
 
-        # Compile kernels
         self._kernels = self._backend.compile_kernels()
-
-        # Create RNG manager for host-side random number generation
         self._rng_manager = _RNGManager(self._batch_size, seed=self._seed)
 
-        # Work out the number of blocks to process the atoms.
+        # Block dimensions.
         self._atom_blocks = self._num_atoms // self._num_threads + 1
-
-        # Work out the number of blocks to process the attempts.
         self._batch_blocks = self._batch_size // self._num_threads + 1
-
-        # Work out the number of blocks to process the waters.
         self._water_blocks = self._num_waters // self._num_threads + 1
 
-        # Initialise the GPU memory.
+        # Attributes set by _initialise_gpu_memory().
+        self._gpu_charge = None
+        self._gpu_sigma = None
+        self._gpu_epsilon = None
+        self._gpu_charge_water = None
+        self._gpu_sigma_water = None
+        self._gpu_epsilon_water = None
+        self._water_state = None
+        self._gpu_is_ghost_water = None
+        self._gpu_water_idx = None
+        self._gpu_water_state = None
+        self._rf_cutoff = None
+        self._rf_kappa = None
+        self._rf_correction = None
+        self._gpu_position = None
+        self._water_positions = None
+        self._energy_coul = None
+        self._energy_lj = None
+        self._accepted = None
+        self._energy_change = None
+        self._probability = None
+        self._deletion_candidates = None
+
+        # --- Initialise GPU memory ---
         self._initialise_gpu_memory()
 
-        # Set the box information.
-        self.set_box(self._system)
+        # --- Box information ---
+        box_size = self._topology.cell.get_size()
+        self.set_box(box_size=box_size)
 
-        # Set constants.
-
-        # Energy conversion factors.
-        self._beta = 1.0 / (
-            _sr.units.k_boltz.to("kcal/(mol*kelvin)") * self._temperature.value()
-        )
+        # --- Constants ---
+        # beta in mol/kJ
+        self._beta = 1.0 / (_KB_KJMOL * self._temperature)
+        # beta for OpenMM energy (kJ/mol)
         self._beta_openmm = 1.0 / (
             _openmm.unit.BOLTZMANN_CONSTANT_kB
             * _openmm.unit.AVOGADRO_CONSTANT_NA
-            * self._temperature.value()
+            * self._temperature
             * _openmm.unit.kelvin
         )
 
-        # Work out the volume of the system and GCMC sphere.
-        volume = self._space.volume().value()
-        gcmc_volume = (4.0 * _np.pi * self._radius.value() ** 3) / 3.0
+        # Volume and Adams parameter.
+        box_volume = box_size[0] * box_size[1] * box_size[2]  # nm^3
+        sphere_volume = (4.0 * _np.pi * self._radius ** 3) / 3.0  # nm^3
 
-        # Work out the Adams value.
-        B = (
-            self._beta * self._excess_chemical_potential.value()
-            + _np.log(gcmc_volume / self._standard_volume.value())
+        B_sphere = (
+            self._beta * self._excess_chemical_potential
+            + _np.log(sphere_volume / self._standard_volume)
         ) + self._adams_shift
 
-        # Work out the bulk Adams value.
         B_bulk = (
-            self._beta * self._excess_chemical_potential.value()
-            + _np.log(volume / self._standard_volume.value())
+            self._beta * self._excess_chemical_potential
+            + _np.log(box_volume / self._standard_volume)
         ) + self._adams_shift
 
-        # Store the exponentials for the Adams values.
-        self._exp_B = _np.exp(B)
-        self._exp_minus_B = _np.exp(-B)
+        if self._reference_indices is not None:
+            _logger.info(f"Adams B_sphere = {B_sphere:.6f}, B_bulk = {B_bulk:.6f}")
+        else:
+            _logger.info(f"Adams B = {B_bulk:.6f}")
+
+        self._exp_B_sphere = _np.exp(B_sphere)
+        self._exp_minus_B_sphere = _np.exp(-B_sphere)
         self._exp_B_bulk = _np.exp(B_bulk)
         self._exp_minus_B_bulk = _np.exp(-B_bulk)
 
-        # Coulomb energy prefactor.
-        self._prefactor = 1.0 / (4.0 * _np.pi * _sr.units.epsilon0.value())
+        # Coulomb prefactor: 1/(4*pi*eps0) in Angstrom units = 332.0637 kcal*A/(mol*e^2)
+        # This is already embedded in the kernel constant `prefactor`.
 
-        # Zero the number of waters in the sampling volume.
+        # Zero counters.
         self._N = 0
-
-        # Zero the statistics.
         self._num_moves = 0
         self._num_accepted = 0
         self._num_accepted_attempts = 0
         self._num_insertions = 0
         self._num_deletions = 0
+        self._ghost_exhausted = False
 
-        # Null the nonbonded forces.
-        self._nonbonded_force = None
-        self._custom_nonbonded_force = None
-
-        # Flag for whether the last move was a bulk sampling move.
+        # Bulk sampling flag.
         self._is_bulk = False
-
-        import sys
-
-        # Create a logger that writes to stderr and the log file.
-        # The 'no_logger' keyword argument can be used to disable logging if
-        # the sampler is being driven by an external package, e.g. SOMD2.
-        if "no_logger" not in kwargs:
-            _logger.remove()
-            _logger.add(sys.stderr, level=self._log_level.upper())
-            if self._log_file is not None:
-                _logger.add(
-                    self._log_file, level=self._log_level.upper(), filter="loch"
-                )
-
-        # Log the Adams value.
-        _logger.debug(f"Adams value: {B:.6f}")
+        self._openmm_context = None
 
         import atexit
-
-        # Register the cleanup function.
         atexit.register(self._cleanup)
 
-        # Check for testing mode.
-        if "test" in kwargs:
-            if kwargs["test"]:
-                _logger.debug("Testing mode enabled")
-                self._is_test = True
-            else:
-                raise ValueError("'test' must be of type 'bool'")
-        else:
-            self._is_test = False
-
-    def __str__(self) -> str:
-        """
-        Return a string representation of the class.
-        """
-
-        return (
-            f"GCMCSampler(self._system, "
-            f"reference={self._reference}, "
-            f"radius={self._radius}, "
-            f"cutoff_type={self._cutoff_type}, "
-            f"cutoff={self._cutoff}, "
-            f"excess_chemical_potential={self._excess_chemical_potential}, "
-            f"standard_volume={self._standard_volume}, "
-            f"temperature={self._temperature}, "
-            f"num_ghost_waters={self._num_ghost_waters}, "
-            f"adams_shift={self._adams_shift}, "
-            f"batch_size={self._batch_size}, "
-            f"num_attempts={self._num_attempts}, "
-            f"num_threads={self._num_threads}), "
-            f"bulk_sampling_probability={self._bulk_sampling_probability}, "
-            f"water_template={self._water_template}, "
-            f"platform={self._platform}, "
-            f"device={self._device}, "
-            f"tolerance={self._tolerance}, "
-            f"nvcc={self._nvcc}, "
-            f"compiler_optimisations={self._compiler_optimisations}, "
-            f"lambda_schedule={self._lambda_schedule}, "
-            f"lambda_value={self._lambda_value}, "
-            f"swap_end_states={self._swap_end_states}, "
-            f"restart={self._restart}, "
-            f"rest2_scale={self._rest2_scale}, "
-            f"rest2_selection={self._rest2_selection}, "
-            f"shift_coulomb={self._shift_coulomb}, "
-            f"shift_delta={self._shift_delta}, "
-            f"overwrite={self._overwrite}, "
-            f"ghost_file={self._ghost_file}, "
-            f"log_file={self._log_file}, "
-            f"log_level={self._log_level}, "
-            f"seed={self._seed})"
-        )
-
-    def __repr__(self) -> str:
-        """
-        Return a string representation of the class.
-        """
-
-        return str(self)
+        # Pre-allocate zero target array for bulk sampling.
+        self._zero_target_gpu = self._backend.to_gpu(_np.zeros(3, dtype=_np.float32))
 
     def _cleanup(self) -> None:
-        """
-        Clean up GPU resources and detach context.
-        """
         try:
             self._rng_manager.shutdown()
         except Exception:
@@ -819,230 +406,88 @@ class GCMCSampler:
         except Exception:
             pass
 
-    def _invalidate_water_caches(self) -> None:
-        """Invalidate cached water indices. Call when _water_state changes."""
-        self._ghost_waters_cache = _np.where(self._water_state == 0)[0]
-        self._non_ghost_waters_cache = _np.where(self._water_state != 0)[0]
 
-    def _get_ghost_waters(self) -> _np.ndarray:
-        """Get indices of ghost waters (cached)."""
-        return self._ghost_waters_cache
-
-    def _get_non_ghost_waters(self) -> _np.ndarray:
-        """Get indices of non-ghost waters (cached)."""
-        return self._non_ghost_waters_cache
-
-    def push(self) -> None:
-        """Push the GPU context onto the calling thread's context stack."""
-        self._backend.push_context()
-
-    def pop(self) -> None:
-        """Pop the GPU context from the calling thread's context stack."""
-        self._backend.pop_context()
+    # --- Properties ---
 
     @property
-    def _kernel_cache_hit(self) -> bool:
-        """Whether kernel compilation was satisfied from cache."""
-        return self._backend.cache_hit
+    def water_state(self) -> _np.ndarray:
+        return self._water_state.copy()
 
-    def system(self) -> _Any:
+    @property
+    def water_indices(self) -> _np.ndarray:
+        return self._water_indices
+
+    @property
+    def box_size(self) -> _np.ndarray:
+        return self._box_size.copy()
+
+    @property
+    def num_insertions(self) -> int:
+        return self._num_insertions
+
+    @property
+    def num_deletions(self) -> int:
+        return self._num_deletions
+
+    @property
+    def ghost_exhausted(self) -> bool:
+        return self._ghost_exhausted
+
+    # --- Public methods ---
+
+    def set_box(self, box_size=None, context=None):
         """
-        Return the GCMC system.
-
-        Returns
-        -------
-
-        system: sire.system.System
-            The GCMC system.
-        """
-        return self._system.clone()
-
-    def compiler_log(self) -> str:
-        """
-        Return the GPU kernel compiler log.
-
-        This includes any warnings generated during kernel compilation.
-        Useful for debugging or investigating compiler messages.
-
-        Returns
-        -------
-
-        log: str
-            The compiler log, or empty string if no warnings/messages.
-        """
-        return self._backend.compiler_log
-
-    def set_box(self, system: _Any) -> None:
-        """
-        Set the box information.
+        Set box dimensions.
 
         Parameters
         ----------
-
-        system: sire.system.System, openmm.Context
-            The molecular system, or OpenMM context.
+        box_size : array-like of float, optional
+            [Lx, Ly, Lz] in nm.
+        context : openmm.Context, optional
+            Extract box from context state.
         """
+        if context is not None:
+            box = context.getState().getPeriodicBoxVectors(asNumpy=True) / _openmm.unit.nanometer
+            box_size = _np.array([box[0][0], box[1][1], box[2][2]])
 
-        # Get the space property from the system.
-        if isinstance(system, _sr.system.System):
-            try:
-                self._space = system.property("space")
-            except Exception:
-                raise ValueError("'system' must contain a 'space' property")
-        # Create a Sire TriclinicBox from the OpenMM box vectors.
-        elif isinstance(system, _openmm.Context):
-            box = system.getState().getPeriodicBoxVectors()
-            v0 = [10 * box[0].x, 10 * box[0].y, 10 * box[0].z]
-            v1 = [10 * box[1].x, 10 * box[1].y, 10 * box[1].z]
-            v2 = [10 * box[2].x, 10 * box[2].y, 10 * box[2].z]
-            self._space = _sr.vol.TriclinicBox(
-                _sr.maths.Vector(*v0), _sr.maths.Vector(*v1), _sr.maths.Vector(*v2)
-            )
-        else:
-            raise ValueError(
-                "'system' must be of type 'sire.system.System' or 'openmm.Context'"
-            )
+        box_size = _np.asarray(box_size, dtype=_np.float64)
+        self._box_size = box_size  # nm
 
-        # Get the box information.
-        self._cell_matrix, self._cell_matrix_inverse, self._M = (
-            self._get_box_information(self._space)
-        )
+        # GPU kernel uses Angstrom.
+        box_ang = box_size * 10.0
+        cell_matrix = _np.diag(box_ang).flatten().astype(_np.float32)
+        cell_matrix_inv = _np.diag(1.0 / box_ang).flatten().astype(_np.float32)
+        M = _np.diag(box_ang ** 2).flatten().astype(_np.float32)
 
-        # Store cell matrices as GPU buffers (used as kernel arguments).
-        self._gpu_cell_matrix = self._cell_matrix
-        self._gpu_cell_matrix_inverse = self._cell_matrix_inverse
-        self._gpu_M = self._M
+        self._gpu_cell_matrix = self._backend.to_gpu(cell_matrix)
+        self._gpu_cell_matrix_inverse = self._backend.to_gpu(cell_matrix_inv)
+        self._gpu_M = self._backend.to_gpu(M)
 
-    def set_bulk_sampling_probability(self, probability: float) -> None:
-        """
-        Set the bulk sampling probability.
-
-        Parameters
-        ----------
-
-        probability: float
-            The bulk sampling probability. This should be between 0 and 1.
-        """
-        try:
-            probability = float(probability)
-        except Exception as e:
-            raise ValueError(
-                f"Could not convert 'bulk_sampling_probability' to float: {e}"
-            )
-
-        if not 0.0 <= probability <= 1.0:
-            raise ValueError("'bulk_sampling_probability' must be between 0 and 1")
-
-        self._bulk_sampling_probability = probability
-
-    def delete_waters(self, context: _openmm.Context) -> None:
-        """
-        Delete any waters within the GCMC sphere. (Convert to ghosts.)
-
-        Parameters
-        ----------
-
-        context: openmm.Context
-            The OpenMM context to use.
-        """
-
-        # Set the NonBondedForce(s).
-        self._set_nonbonded_forces(context)
-
-        # Get the OpenMM state.
-        state = context.getState(getPositions=True)
-
-        # Get the current positions in Angstrom.
-        positions = state.getPositions(asNumpy=True) / _openmm.unit.angstrom
-
-        # Get the position of the GCMC sphere centre.
-        target = self._backend.to_gpu(
-            self._get_target_position(positions).astype(_np.float32)
-        )
-
-        # Upload atom positions to GPU.
-        self._gpu_position = self._backend.to_gpu(_as_float32(positions).flatten())
-
-        # Find the non-ghost waters within the GCMC region.
-        self._kernels["deletion"](
-            _np.int32(self._num_waters),
-            self._deletion_candidates,
-            self._backend.to_gpu(target.astype(_np.float32)),
-            _np.float32(self._radius.value()),
-            self._gpu_position,
-            self._gpu_water_idx,
-            self._gpu_water_state,
-            self._gpu_cell_matrix_inverse,
-            self._gpu_M,
-            block=(self._num_threads, 1, 1),
-            grid=(self._water_blocks, 1, 1),
-        )
-
-        # Get the candidates.
-        candidates = self._backend.from_gpu(self._deletion_candidates).flatten()
-
-        # Find the waters within the GCMC sphere.
-        candidates = _np.where(candidates == 1)[0]
-
-        _logger.info(f"Deleting {len(candidates)} waters from the GCMC sphere")
-
-        # Loop over the candidates and delete them.
-        for idx in candidates:
-            self._accept_deletion(idx, context)
-
-        # Set the number of waters in the GCMC sphere to zero.
-        self._N = 0
 
     def num_waters(self, context=None) -> int:
-        """
-        Return the number of waters in the GCMC region.
+        """Return the number of real (non-ghost) molecules in the GCMC region."""
+        if self._reference_indices is None:
+            return int(_np.sum(self._water_state == 1))
 
-        Returns
-        -------
+        # After a bulk move, _N reflects box count not sphere count — recompute.
+        if context is None and self._is_bulk:
+            context = self._openmm_context
 
-        num_waters: int
-            The number of waters.
-
-        context: openmm.Context, optional
-            The OpenMM context to use for counting the waters. If None, then the
-            internal context will be used if available.
-        """
-
-        # Whether we need to recalculate the number of waters in the GCMC sphere.
-        recalculate = context is not None or (
-            self._reference is not None and self._is_bulk
-        )
-
-        # We need to recalculate the number of waters.
-        if recalculate:
-            if context is None:
-                if not self._openmm_context:
-                    msg = "OpenMM context is not set!"
-                    _logger.error(msg)
-                    raise RuntimeError(msg)
-                else:
-                    context = self._openmm_context
-
-            # Get the OpenMM state.
+        if context is not None:
+            # Recompute _N by running deletion kernel on current positions.
             state = context.getState(getPositions=True)
-
-            # Get the current positions in Angstrom.
             positions = state.getPositions(asNumpy=True) / _openmm.unit.angstrom
 
-            # Get the position of the GCMC sphere centre.
             target = self._backend.to_gpu(
                 self._get_target_position(positions).astype(_np.float32)
             )
-
-            # Upload atom positions to GPU.
             self._gpu_position = self._backend.to_gpu(_as_float32(positions).flatten())
 
-            # Find the non-ghost waters within the GCMC region.
             self._kernels["deletion"](
                 _np.int32(self._num_waters),
                 self._deletion_candidates,
-                self._backend.to_gpu(target.astype(_np.float32)),
-                _np.float32(self._radius.value()),
+                target,
+                _np.float32(self._radius * 10.0),
                 self._gpu_position,
                 self._gpu_water_idx,
                 self._gpu_water_state,
@@ -1052,281 +497,88 @@ class GCMCSampler:
                 grid=(self._water_blocks, 1, 1),
             )
 
-            # Get the candidates.
             candidates = self._backend.from_gpu(self._deletion_candidates).flatten()
-
-            # Find the waters within the GCMC sphere.
-            candidates = _np.where(candidates == 1)[0]
-
-            # Set the number of waters.
-            self._N = len(candidates)
-
-            # Reset the bulk sampling flag.
+            self._N = int(_np.sum(candidates == 1))
             self._is_bulk = False
 
+        # If last move was sphere-targeted, _N is already up to date.
         return self._N
 
-    def num_accepted_moves(self) -> int:
-        """
-        Return the number of accepted moves.
-
-        Returns
-        -------
-
-        num_accepted: int
-            The number of accepted moves.
-        """
-        return self._num_accepted
-
-    def num_accepted_attempts(self) -> int:
-        """
-        Return the number accepted attempts. (Note that, when using PME, this
-        is the number of accepted attempts for the approximate RF potential.)
-
-        Returns
-        -------
-
-        num_accepted_attempts: int
-            The total number of accepted attempts.
-        """
-        return self._num_accepted_attempts
-
-    def water_state(self) -> _np.ndarray:
-        """
-        Return the current water state array: 0 = ghost water, 1 = real water.
-        """
-        return self._water_state.copy()
 
     def move_acceptance_probability(self) -> float:
+        total_attempts = self._num_moves * self._num_attempts
+        if total_attempts == 0:
+            return 0.0
+        return self._num_accepted / total_attempts
+
+
+    # --- Main GCMC move ---
+
+    def move(self, context: _openmm.Context) -> list:
         """
-        Return the acceptance probability. Note that this can be greater than
-        1, since multiple insertions/deletions can be accepter per move.
-
-        Returns
-        -------
-
-        acceptance_probability: float
-            The acceptance probability.
-        """
-        return self._num_accepted / self._num_moves
-
-    def attempt_acceptance_probability(self) -> float:
-        """
-        Return the acceptance probability per attempt. (Note that, when using
-        PME, this is acceptance probability for the approximate RF potential.)
-
-        Returns
-        -------
-
-        acceptance_probability: float
-            The acceptance probability per attempt.
-        """
-        return self._num_accepted_attempts / (self._num_moves * self._num_attempts)
-
-    def num_insertions(self) -> int:
-        """
-        Return the number of accepted insertions.
-
-        Returns
-        -------
-
-        num_insertions: int
-            The number of accepted insertions.
-        """
-        return self._num_insertions
-
-    def num_deletions(self) -> int:
-        """
-        Return the number of accepted deletions.
-
-        Returns
-        -------
-
-        num_deletions: int
-            The number of accepted deletions.
-        """
-        return self._num_deletions
-
-    def reset(self) -> None:
-        """
-        Reset the sampler.
-        """
-        # Zero the number of accepted moves.
-        self._num_accepted = 0
-        self._num_insertions = 0
-        self._num_deletions = 0
-        self._num_moves = 0
-        self._num_accepted_attempts = 0
-        self._num_accepted_insertions = 0
-        self._num_accepted_deletions = 0
-
-        # Clear the forces.
-        self._nonbonded_force = None
-        self._custom_nonbonded_force = None
-
-        # Clear the OpenMM context.
-        self._openmm_context = None
-
-    def restore_stats(self, stats: dict) -> None:
-        """
-        Restore sampler statistics from a dictionary.
+        Perform num_attempts trial insertion/deletion moves.
 
         Parameters
         ----------
-
-        stats : dict
-            Dictionary of sampler statistics as returned by ``get_stats()``.
-        """
-        self._num_moves = stats["num_moves"]
-        self._num_accepted = stats["num_accepted"]
-        self._num_insertions = stats["num_insertions"]
-        self._num_deletions = stats["num_deletions"]
-        self._num_accepted_attempts = stats["num_accepted_attempts"]
-        self._num_accepted_insertions = stats["num_accepted_insertions"]
-        self._num_accepted_deletions = stats["num_accepted_deletions"]
-
-    def get_stats(self) -> dict:
-        """
-        Return the current sampler statistics as a dictionary.
+        context : openmm.Context
+            The OpenMM context.
 
         Returns
         -------
-
-        dict
-            Dictionary of sampler statistics.
+        moves : list of int
+            Accepted moves (0=insertion, 1=deletion).
         """
-        return {
-            "num_moves": self._num_moves,
-            "num_accepted": self._num_accepted,
-            "num_insertions": self._num_insertions,
-            "num_deletions": self._num_deletions,
-            "num_accepted_attempts": self._num_accepted_attempts,
-            "num_accepted_insertions": self._num_accepted_insertions,
-            "num_accepted_deletions": self._num_accepted_deletions,
-        }
-
-    def ghost_residues(self) -> _np.ndarray:
-        """
-        Return the residue indices of the current ghost waters in the input
-        topology. These are Sire/BioSimSpace residue indices and do not
-        include any virtual site particles that were added on context creation.
-
-        Returns
-        -------
-
-        ghost_residues: np.ndarray
-            The indices of the ghost water residues.
-        """
-
-        # Now extract and return the residue indices.
-        return self._water_residues[self._get_ghost_waters()]
-
-    def write_ghost_residues(self) -> None:
-        """
-        Write the current indices of the ghost water residues to a file.
-        """
-
-        if self._ghost_file is None:
-            raise ValueError("'ghost_file' is set to None!")
-
-        # Get the ghost residues.
-        ghost_residues = self.ghost_residues()
-
-        # Append a comma-separated list of ghost residue indices to the file.
-        with open(self._ghost_file, "a") as f:
-            f.write(f"{', '.join([str(x) for x in ghost_residues])}\n")
-
-    def move(self, context: _openmm.Context) -> list[int]:
-        """
-        Perform num_attempts trial moves.
-
-        Parameters
-        ----------
-
-        context: openmm.Context
-            The OpenMM context to use.
-
-        Returns
-        -------
-
-        moves: [int]
-            A list of the accepted moves. (0 = insertion, 1 = deletion)
-        """
-        # Increment the number of moves.
         self._num_moves += 1
 
-        # Set the NonBondedForce(s).
-        self._set_nonbonded_forces(context)
-
-        # Zero the number of attempts and batch index.
         num_attempts = 0
         num_batches = 1
-
-        # Initialise the acceptance flags.
         is_accepted = False
-
-        # Create the moves list.
         moves = []
 
-        # Decide if this is a bulk sampling move.
+        # Decide bulk vs sphere sampling.
         self._is_bulk = True
-        if self._reference is not None:
+        if self._reference_indices is not None:
             if self._rng.random() > self._bulk_sampling_probability:
                 self._is_bulk = False
 
-        # Loop until we have the required number of attempts.
         while num_attempts < self._num_attempts:
-            _logger.debug(f"Processing batch number {num_batches}")
-            _logger.debug(f"Completed {num_attempts} of {self._num_attempts} attempts")
-            _logger.debug(f"Number of accepted moves: {self._num_accepted}")
-            _logger.debug(f"Number of accepted insertions: {self._num_insertions}")
-            _logger.debug(f"Number of accepted deletions: {self._num_deletions}")
+            _logger.debug(f"Batch {num_batches}, attempts {num_attempts}/{self._num_attempts}")
 
-            # Prepare the GPU state for the next batch.
             if num_batches == 1 or is_accepted:
-                # We only need to get the positions and initial energy for the first
-                # batch. These will be updated dynamically as moves are accepted.
                 if num_batches == 1:
-                    # Detect GCMC LRC parameters from context on first call.
-                    if not self._has_gcmc_lrc:
-                        self._init_gcmc_lrc(context)
-
-                    # Get the OpenMM state.
                     state = context.getState(getPositions=True, getEnergy=self._is_pme)
-
-                    # Get the current positions in OpenMM format and in Angstrom.
                     positions_openmm = state.getPositions(asNumpy=True)
                     positions_angstrom = positions_openmm / _openmm.unit.angstrom
 
-                    # If we're using PME, then compute the initial energy.
                     if self._is_pme:
                         initial_energy = state.getPotentialEnergy()
                     else:
                         initial_energy = None
 
-                    # Cache the box volume (NVT, so constant throughout).
-                    if self._has_gcmc_lrc:
-                        box = state.getPeriodicBoxVectors(asNumpy=True)
-                        v_nm3 = _np.linalg.det(box / _openmm.unit.nanometer)
+                    self.set_box(context=context)
+                    box_volume = self._box_size[0] * self._box_size[1] * self._box_size[2]
+                    B_bulk = (
+                        self._beta * self._excess_chemical_potential
+                        + _np.log(box_volume / self._standard_volume)
+                    ) + self._adams_shift
+                    self._exp_B_bulk = _np.exp(B_bulk)
+                    self._exp_minus_B_bulk = _np.exp(-B_bulk)
+                    v_nm3 = box_volume
 
-                    # Sample within the GCMC sphere.
-                    if self._reference is not None and not self._is_bulk:
-                        target = self._get_target_position(positions_angstrom).astype(
-                            _np.float32
-                        )
+                    if self._reference_indices is not None and not self._is_bulk:
+                        target = self._get_target_position(positions_angstrom).astype(_np.float32)
 
-                    # Upload atom positions to GPU.
                     self._gpu_position = self._backend.to_gpu(
                         _as_float32(positions_angstrom).flatten()
                     )
 
-                # Work out the number of waters in the sampling volume.
+                # Find deletion candidates.
                 if not self._is_bulk:
                     self._kernels["deletion"](
                         _np.int32(self._num_waters),
                         self._deletion_candidates,
                         self._backend.to_gpu(_as_float32(target)),
-                        _np.float32(self._radius.value()),
+                        _np.float32(self._radius * 10.0),  # nm → Å
                         self._gpu_position,
                         self._gpu_water_idx,
                         self._gpu_water_state,
@@ -1335,73 +587,47 @@ class GCMCSampler:
                         block=(self._num_threads, 1, 1),
                         grid=(self._water_blocks, 1, 1),
                     )
-
-                    # Get the candidates.
                     deletion_candidates = self._backend.from_gpu(
                         self._deletion_candidates
                     ).flatten()
-
-                    # Find the waters within the GCMC sphere.
                     deletion_candidates = _np.where(deletion_candidates == 1)[0]
-
-                # Use all non-ghost waters.
                 else:
                     _logger.debug("Sampling within the entire simulation box")
                     deletion_candidates = self._get_non_ghost_waters()
                     target = None
 
-                # Get the current ghost waters.
                 ghost_waters = self._get_ghost_waters()
-
-                # If there are no ghost waters, then we can't perform any insertions.
                 if len(ghost_waters) == 0:
-                    msg = "Cannot insert any more waters. Please increase 'num_ghost_waters'."
-                    _logger.error(msg)
-                    raise RuntimeError(msg)
+                    _logger.error("Ghost molecules exhausted")
+                    self._ghost_exhausted = True
+                    return moves
 
-                # Choose a random ghost water.
                 idx_water = self._rng.choice(ghost_waters)
 
-                # Get the template positions for the water insertion.
                 start_idx = self._water_indices[idx_water]
                 template_positions = self._backend.to_gpu(
                     _as_float32(
-                        positions_angstrom[start_idx : start_idx + self._num_points]
+                        positions_angstrom[start_idx: start_idx + self._num_points]
                     ).flatten()
                 )
 
-                # Set the number of waters.
                 self._N = len(deletion_candidates)
 
-            # Reset the batch acceptance flag.
             is_accepted = False
-
-            # Reset the move type.
             move = None
 
-            # Log the current number of waters.
-            _logger.debug(f"Number of waters in sampling volume: {self._N}")
-            _logger.debug(f"Water indices: {deletion_candidates}")
+            _logger.debug(f"N in sampling volume: {self._N}")
 
-            # Draw batch_size samples from the deletion candidates.
-            if len(deletion_candidates) > 0:
-                candidates = self._rng.choice(
-                    deletion_candidates, size=self._batch_size
-                )
-                candidates_gpu = self._backend.to_gpu(_as_int32(candidates))
-
-                # Generate the array of moves types. (0 = insertion, 1 = deletion)
-                is_deletion = self._rng.choice(2, size=self._batch_size)
-                is_deletion_gpu = self._backend.to_gpu(_as_int32(is_deletion))
-            # If there are no deletion candidates, then we can only perform
-            # insertion moves.
-            else:
+            if self._insert_only or len(deletion_candidates) == 0:
                 candidates = _np.zeros(self._batch_size, dtype=_np.int32)
                 candidates_gpu = self._backend.to_gpu(candidates)
                 is_deletion = _np.zeros(self._batch_size, dtype=_np.int32)
                 is_deletion_gpu = self._backend.to_gpu(is_deletion)
-
-            _logger.debug("Preparing insertion candidates")
+            else:
+                candidates = self._rng.choice(deletion_candidates, size=self._batch_size)
+                candidates_gpu = self._backend.to_gpu(_as_int32(candidates))
+                is_deletion = self._rng.choice(2, size=self._batch_size)
+                is_deletion_gpu = self._backend.to_gpu(_as_int32(is_deletion))
 
             if target is None:
                 target_gpu = self._zero_target_gpu
@@ -1411,22 +637,24 @@ class GCMCSampler:
             else:
                 target_gpu = self._backend.to_gpu(_as_float32(target))
                 is_target = _np.int32(1)
-                exp_B = self._exp_B
-                exp_minus_B = self._exp_minus_B
+                exp_B = self._exp_B_sphere
+                exp_minus_B = self._exp_minus_B_sphere
 
-            # Get pre-computed random numbers for this batch.
             batch_randoms = self._rng_manager.get_batch_randoms()
             randoms_rotation = self._backend.to_gpu(batch_randoms.rotation)
-            randoms_position = self._backend.to_gpu(batch_randoms.position)
+            if is_target:
+                randoms_position = self._backend.to_gpu(batch_randoms.direction)
+            else:
+                randoms_position = self._backend.to_gpu(batch_randoms.position)
             randoms_radius = self._backend.to_gpu(batch_randoms.radius)
 
-            # Generate the random water positions and orientations.
+            # Generate random positions/orientations.
             self._kernels["water"](
                 _np.int32(self._num_points),
                 _np.int32(self._batch_size),
                 template_positions,
                 target_gpu,
-                _np.float32(self._radius.value()),
+                _np.float32(self._radius * 10.0),  # nm → Å
                 self._water_positions,
                 is_target,
                 randoms_rotation,
@@ -1437,7 +665,7 @@ class GCMCSampler:
                 grid=(self._batch_blocks, 1, 1),
             )
 
-            # Perform the energy calculation.
+            # Compute energy.
             self._kernels["energy"](
                 _np.int32(self._num_points),
                 _np.int32(self._batch_size),
@@ -1447,14 +675,11 @@ class GCMCSampler:
                 self._energy_lj,
                 candidates_gpu,
                 is_deletion_gpu,
-                _np.int32(self._is_fep),
                 self._gpu_position,
                 self._gpu_charge,
                 self._gpu_sigma,
                 self._gpu_epsilon,
-                self._gpu_alpha,
                 self._gpu_is_ghost_water,
-                self._gpu_is_ghost_fep,
                 self._gpu_sigma_water,
                 self._gpu_epsilon_water,
                 self._gpu_charge_water,
@@ -1464,26 +689,21 @@ class GCMCSampler:
                 self._rf_cutoff,
                 self._rf_kappa,
                 self._rf_correction,
-                self._sc_softcore_form,
-                self._sc_shift_coulomb,
-                self._sc_shift_delta,
-                self._sc_taylor_power,
-                self._sc_beutler_alpha,
+                _np.int32(self._combining_rule),
                 block=(self._num_threads, 1, 1),
                 grid=(self._atom_blocks, self._batch_size, 1),
             )
 
-            # Transfer pre-computed acceptance randoms to GPU.
             randoms_acceptance = self._backend.to_gpu(batch_randoms.acceptance)
 
-            # Check the acceptance for each trial state.
+            # Check acceptance.
             self._kernels["acceptance"](
                 _np.int32(self._batch_size),
                 _np.int32(self._num_atoms),
                 _np.int32(self._N),
                 _np.float32(exp_B),
                 _np.float32(exp_minus_B),
-                _np.float32(self._beta),
+                _np.float32(self._beta * 4.184),  # mol/kJ → mol/kcal for kernel
                 is_deletion_gpu,
                 self._energy_coul,
                 self._energy_lj,
@@ -1496,976 +716,572 @@ class GCMCSampler:
                 grid=(self._batch_blocks, 1, 1),
             )
 
-            # Get the acceptance array.
-            accepted = _np.where(self._backend.from_gpu(self._accepted).flatten() == 1)[
-                0
-            ]
-
-            # Store the number of accepted attempts.
+            accepted = _np.where(self._backend.from_gpu(self._accepted).flatten() == 1)[0]
             num_accepted_attempts = len(accepted)
             self._num_accepted_attempts += num_accepted_attempts
 
-            _logger.debug(f"Number of accepted attempts: {num_accepted_attempts}")
-            _logger.debug(
-                f"Total number of accepted attempts: {self._num_accepted_attempts}"
-            )
+            num_attempts += self._batch_size
 
-            # No moves were accepted for this batch. Just increment the
-            # number of attempts.
             if num_accepted_attempts == 0:
-                num_attempts += self._batch_size
                 num_batches += 1
                 continue
 
-            # For PME we consider each accepted trial in turn, checking to
-            # see whether it is accepted via the Gelb correction.
             if self._is_pme:
                 max_accepted = num_accepted_attempts
-                # Read energy changes once for all accepted trials.
                 energy_changes = self._backend.from_gpu(self._energy_change).flatten()
-            # For RF we just use the first accepted trial.
             else:
                 max_accepted = 1
                 energy_changes = None
 
-            # Loop over the accepted trials.
             for i in range(max_accepted):
-                # Get the index of the accepted trial.
                 idx = accepted[i]
 
-                # Update the number of attempts.
-                num_attempts += idx + 1
-
-                # We've exceeded the number of attempts so reject the move.
-                if num_attempts > self._num_attempts:
-                    move = None
-                    is_accepted = False
-                    break
-
-                # Insertion move.
+                # Insertion.
                 if is_deletion[idx] == 0:
-                    # Capture n_w before the insertion for LRC delta calculation.
-                    if self._has_gcmc_lrc:
-                        n_w_before_insert = context.getParameter("n_w")
+                    if self._use_lrc:
+                        n_w_before = float(self._N)
 
-                    # Accept the move.
                     self._accept_insertion(
                         idx, idx_water, positions_openmm, positions_angstrom, context
                     )
-
-                    # Update the acceptance statistics.
                     self._num_accepted += 1
                     self._num_insertions += 1
-
-                    # Initalise the acceptance variables.
                     is_accepted = True
                     move = 0
 
-                    # Set null values for the PME energy and probability.
-                    pme_energy = None
-                    pme_probability = None
-
-                    # Apply the PME correction.
                     if self._is_pme:
-                        # Get the energy change in kcal/mol.
                         dE_RF = energy_changes[idx] * _openmm.unit.kilocalories_per_mole
+                        final_energy = context.getState(getEnergy=True).getPotentialEnergy()
 
-                        # Get the new energy.
-                        final_energy = context.getState(
-                            getEnergy=True
-                        ).getPotentialEnergy()
-
-                        # Add the analytic LRC delta so the PME correction sees only
-                        # the RF→PME electrostatic difference.
-                        if self._has_gcmc_lrc:
-                            dLRC = (
-                                (
-                                    self._lrc_w_solute
-                                    + 2.0 * n_w_before_insert * self._lrc_ww_half
-                                )
-                                / v_nm3
-                                * _openmm.unit.kilojoules_per_mole
-                            )
-                            dE_RF += dLRC
-
-                        # Compute the PME acceptance correction.
                         acc_prob = _np.exp(
-                            min(
-                                0.0,
-                                -self._beta_openmm
-                                * (final_energy - initial_energy - dE_RF),
-                            )
+                            min(0.0, -self._beta_openmm * (final_energy - initial_energy - dE_RF))
                         )
 
-                        # Store the PME energy change and acceptance probability.
-                        pme_energy = final_energy - initial_energy
-                        pme_probability = acc_prob
-
-                        # The move was rejected.
                         if acc_prob < self._rng.random():
-                            # Revert the move.
-                            _ = self._accept_deletion(idx_water, context)
-
-                            # Update the acceptance statistics.
+                            self._accept_deletion(idx_water, context)
                             self._num_accepted -= 1
                             self._num_insertions -= 1
-
-                            # Revert the number of attempts.
-                            num_attempts -= idx + 1
-
                             is_accepted = False
                             move = None
 
-                            # Log that the insertion was rejected.
-                            if self._is_debug:
-                                dE_RF = dE_RF.value_in_unit(
-                                    _openmm.unit.kilocalories_per_mole
-                                )
-                                dE_PME = (final_energy - initial_energy).value_in_unit(
-                                    _openmm.unit.kilocalories_per_mole
-                                )
-
-                                _logger.debug(
-                                    f"Rejected PME insertion: dE RF={dE_RF:.3f} kcal/mol, "
-                                    f"dE PME={dE_PME:.3f} kcal/mol, acc prob={acc_prob:.3f}"
-                                )
-
-                    # Log the insertion and break.
-                    if is_accepted:
-                        # Log the accepted candidate.
-                        _logger.debug(
-                            f"Accepted insertion: candidate={idx}, water={idx}"
+                    elif self._use_lrc:
+                        dLRC = (
+                            (self._lrc_w_solute + 2.0 * n_w_before * self._lrc_ww_half)
+                            / v_nm3
                         )
+                        acc_prob = _np.exp(min(0.0, -self._beta * dLRC))
+                        if acc_prob < self._rng.random():
+                            self._accept_deletion(idx_water, context)
+                            self._num_accepted -= 1
+                            self._num_insertions -= 1
+                            is_accepted = False
+                            move = None
 
-                        if self._is_debug:
-                            self._log_insertion(
-                                idx,
-                                idx_water,
-                                pme_energy=pme_energy,
-                                pme_probability=pme_probability,
-                            )
+                    if is_accepted:
+                        _logger.debug(f"Accepted insertion: water={idx_water}")
                         break
 
-                # Deletion move.
+                # Deletion.
                 else:
-                    # Capture n_w before the deletion for LRC delta calculation.
-                    if self._has_gcmc_lrc:
-                        n_w_before_delete = context.getParameter("n_w")
+                    if self._use_lrc:
+                        n_w_before = float(self._N)
 
-                    # Accept the move.
                     self._accept_deletion(candidates[idx], context)
-
-                    # Update the acceptance statistics.
                     self._num_accepted += 1
                     self._num_deletions += 1
-
-                    # Initalise the acceptance variables.
                     is_accepted = True
                     move = 1
 
-                    # Set null values for the PME energy and probability.
-                    pme_energy = None
-                    pme_probability = None
-
-                    # Apply the PME correction.
                     if self._is_pme:
-                        # Get the energy change in kcal/mol.
                         dE_RF = energy_changes[idx] * _openmm.unit.kilocalories_per_mole
+                        final_energy = context.getState(getEnergy=True).getPotentialEnergy()
 
-                        # Get the new energy.
-                        final_energy = context.getState(
-                            getEnergy=True
-                        ).getPotentialEnergy()
-
-                        # Add the analytic LRC delta.
-                        if self._has_gcmc_lrc:
-                            dLRC = (
-                                -(
-                                    self._lrc_w_solute
-                                    + 2.0
-                                    * (n_w_before_delete - 1.0)
-                                    * self._lrc_ww_half
-                                )
-                                / v_nm3
-                                * _openmm.unit.kilojoules_per_mole
-                            )
-                            dE_RF += dLRC
-
-                        # Compute the PME acceptance correction.
                         acc_prob = _np.exp(
-                            min(
-                                0.0,
-                                -self._beta_openmm
-                                * (final_energy - initial_energy - dE_RF),
-                            )
+                            min(0.0, -self._beta_openmm * (final_energy - initial_energy - dE_RF))
                         )
 
-                        # Store the PME energy change and acceptance probability.
-                        pme_energy = final_energy - initial_energy
-                        pme_probability = acc_prob
-
-                        # The move was rejected.
                         if acc_prob < self._rng.random():
-                            # Revert the move.
                             self._reject_deletion(candidates[idx], context)
-
-                            # Update the acceptance statistics.
                             self._num_accepted -= 1
                             self._num_deletions -= 1
-
-                            # Revert the number of attempts.
-                            num_attempts -= idx + 1
-
                             is_accepted = False
                             move = None
 
-                            # Log that the deletion was rejected.
-                            if self._is_debug:
-                                dE_RF = dE_RF.value_in_unit(
-                                    _openmm.unit.kilocalories_per_mole
-                                )
-                                dE_PME = (final_energy - initial_energy).value_in_unit(
-                                    _openmm.unit.kilocalories_per_mole
-                                )
-
-                                _logger.debug(
-                                    f"Rejected PME deletion: dE RF={dE_RF:.3f} kcal/mol, "
-                                    f"dE PME={dE_PME:.3f} kcal/mol, acc prob={acc_prob:.3f}"
-                                )
-
-                    # Log the deletion and break.
-                    if is_accepted:
-                        # Log the accepted candidate.
-                        _logger.debug(
-                            f"Accepted deletion: candidate={idx}, water={candidates[idx]}"
+                    elif self._use_lrc:
+                        dLRC = (
+                            -(self._lrc_w_solute + 2.0 * (n_w_before - 1.0) * self._lrc_ww_half)
+                            / v_nm3
                         )
+                        acc_prob = _np.exp(min(0.0, -self._beta * dLRC))
+                        if acc_prob < self._rng.random():
+                            self._reject_deletion(candidates[idx], context)
+                            self._num_accepted -= 1
+                            self._num_deletions -= 1
+                            is_accepted = False
+                            move = None
 
-                        if self._is_debug:
-                            self._log_deletion(
-                                idx,
-                                candidates,
-                                positions_angstrom,
-                                pme_energy=pme_energy,
-                                pme_probability=pme_probability,
-                            )
+                    if is_accepted:
+                        _logger.debug(f"Accepted deletion: water={candidates[idx]}")
                         break
 
-            # Update the move acceptance flag and append the move.
             if is_accepted:
                 moves.append(move)
-
-                # Update the initial energy.
                 if self._is_pme:
                     initial_energy = final_energy
 
-                # Return immediately if we're in test mode.
-                if self._is_test:
-                    return moves
-            # If no moves were accepted at the PME level, then update the
-            # number of attempts by the batch size.
-            else:
-                if self._is_pme:
-                    num_attempts += self._batch_size
-
-            # Increment the number of batches.
             num_batches += 1
 
-        # If this was a bulk sampling move, then store the context. This allows
-        # us to work out the number of waters in the GCMC sphere if the user
-        # calls self.num_waters() after the move.
-        if self._reference is not None and self._is_bulk:
+        if self._reference_indices is not None and self._is_bulk:
             self._openmm_context = context
 
         return moves
 
-    def bind_dynamics(self, dynamics: _Any) -> None:
+    # --- Private methods ---
+
+    def _get_ghost_waters(self) -> _np.ndarray:
+        return _np.where(self._water_state == 0)[0]
+
+    def _get_non_ghost_waters(self) -> _np.ndarray:
+        return _np.where(self._water_state != 0)[0]
+
+    def _get_target_position(self, positions_ang):
+        """Compute GCMC sphere center using minimum-image convention (rectangular)."""
+        ref = positions_ang[self._reference_indices]
+        box_ang = self._box_size * 10.0
+        delta = ref - ref[0]
+        delta -= _np.round(delta / box_ang) * box_ang
+        center = ref[0] + delta.mean(axis=0)
+        return center.astype(_np.float32)
+
+    def _prepare_system(self):
         """
-        Bind the GCMC sampler to a Sire Dynamics object.
-
-        Parameters
-        ----------
-
-        dynamics: sire.mol.Dynamics
+        Find target molecules, build extended topology with ghost molecules,
+        export to OpenMM (generating all bonded forces), then post-process
+        nonbonded parameters to create the ghost/real toggle mechanism.
         """
+        topology = self._topology
 
-        if not isinstance(dynamics, _sr.mol.Dynamics):
-            raise ValueError("'dynamics' must be of type 'sire.mol.Dynamics'")
-
-        dynamics._d._gcmc_sampler = self
-
-    @staticmethod
-    def _validate_sire_unit(parameter: str, value: str, unit: _Any) -> _Any:
-        """
-        Validate a Sire unit.
-
-        Parameters
-        ----------
-
-        parameter: str
-            The name of the parameter.
-
-        value: str, sire.units.GeneralUnit
-            The value or GeneralUnit to validate.
-
-        unit: str
-            The unit to validate.
-
-        Returns
-        -------
-
-        u: sire.units.GeneralUnit
-            The validated unit.
-        """
-
-        if not isinstance(value, (str, _sr.units.GeneralUnit)):
+        # Find existing target molecules by residue name.
+        target_residues = [r for r in topology.residues if r.name == self._residue_name]
+        if len(target_residues) == 0:
+            avail = sorted(set(r.name for r in topology.residues))
             raise ValueError(
-                f"'{parameter}' must be of type 'str' or 'sire.units.GeneralUnit'"
+                f"No residues with name '{self._residue_name}' found in system. "
+                f"Available: {avail}. For dry systems, add a template molecule "
+                f"to the topology and use ghost_existing=True."
             )
 
-        try:
-            u = _sr.u(value)
-        except Exception as e:
-            raise ValueError(f"Could not parse '{parameter}': {e}")
+        template_mol = target_residues[0].atoms[0].molecule
+        template_atoms = target_residues[0].atoms
 
-        if not u.has_same_units(unit):
-            raise ValueError(f"Invalid units for '{parameter}'")
+        self._num_points = len(template_atoms)
 
-        return u
+        # Extract template properties.
+        template_positions_nm = _np.array([a.position for a in template_atoms])
+        template_charges = _np.array([a.charge for a in template_atoms])
+        template_sigmas = _np.zeros(self._num_points)
+        template_epsilons = _np.zeros(self._num_points)
+        for i, atom in enumerate(template_atoms):
+            vdw = self._system.atom_vdw_terms[atom]
+            template_sigmas[i] = vdw.sigma  # nm
+            template_epsilons[i] = vdw.epsilon  # kJ/mol
 
-    def _get_box_information(self, space):
-        """
-        Get the box information from the system.
+        # Store template params in kernel units (Å, kcal/mol) for GPU.
+        self._water_charge = template_charges  # elementary charge
+        self._water_sigma = template_sigmas * 10.0  # Å
+        self._water_epsilon = template_epsilons / 4.184  # kcal/mol
 
-        Parameters
-        ----------
-
-        space: sire.vol.PeriodicBox, sire.vol.TriclinicBox
-            The simulation box.
-
-        Returns
-        -------
-
-        cell_matrix: pycuda.gpuarray.GPUArray
-            The cell matrix.
-
-        cell_matrix_inverse: pycuda.gpuarray.GPUArray
-            The inverse of the cell matrix.
-
-        M: pycuda.gpuarray.GPUArray
-            The matrix M.
-        """
-
-        # Validate input.
-        if not isinstance(space, _sr.vol.Cartesian):
+        # --- Build extended topology with ghost molecules ---
+        n_existing_ghosts = len(target_residues) if self._ghost_existing else 0
+        n_extra_ghosts = self._num_ghost_waters - n_existing_ghosts
+        if n_extra_ghosts < 0:
             raise ValueError(
-                "'space' must be of type 'sire.vol.PeriodicBox' or 'sire.vol.TriclinicBox'"
+                f"num_ghost_waters ({self._num_ghost_waters}) must be >= "
+                f"existing target molecules ({n_existing_ghosts}) when ghost_existing=True"
             )
-
-        cell_matrix = space.box_matrix()
-        cell_matrix_inverse = cell_matrix.inverse()
-        M = cell_matrix.transpose() * cell_matrix
-
-        # Convert to NumPy.
-        row0 = [x.value() for x in cell_matrix.row0()]
-        row1 = [x.value() for x in cell_matrix.row1()]
-        row2 = [x.value() for x in cell_matrix.row2()]
-        cell_matrix = _np.array([row0, row1, row2])
-        row0 = [x.value() for x in cell_matrix_inverse.row0()]
-        row1 = [x.value() for x in cell_matrix_inverse.row1()]
-        row2 = [x.value() for x in cell_matrix_inverse.row2()]
-        cell_matrix_inverse = _np.array([row0, row1, row2])
-        row0 = [x.value() for x in M.row0()]
-        row1 = [x.value() for x in M.row1()]
-        row2 = [x.value() for x in M.row2()]
-        M = _np.array([row0, row1, row2])
-
-        # Convert to GPU memory.
-        cell_matrix = self._backend.to_gpu(cell_matrix.flatten().astype(_np.float32))
-        cell_matrix_inverse = self._backend.to_gpu(
-            cell_matrix_inverse.flatten().astype(_np.float32)
+        extended_top = _MstkTopology(
+            topology.molecules + [template_mol] * n_extra_ghosts
         )
-        M = self._backend.to_gpu(M.flatten().astype(_np.float32))
+        extended_top.cell = topology.cell
 
-        return cell_matrix, cell_matrix_inverse, M
+        # Create new mstk System from extended topology (generates all bonded forces).
+        extended_system = _MstkSystem(extended_top, self._ff)
+        self.omm_system = extended_system.to_omm_system()
 
-    @staticmethod
-    def _get_vsite_offsets(system):
-        """
-        Compute per-atom OpenMM index offsets due to virtual sites.
+        # --- Identify target residues in extended topology ---
+        # All GCMC molecules (real + ghost) in extended topology.
+        all_gcmc_residues = [
+            r for r in extended_top.residues if r.name == self._residue_name
+        ]
+        n_real_mols = 0 if self._ghost_existing else len(target_residues)
 
-        In OpenMM, virtual site particles are appended after the real atoms
-        of each molecule. Molecules that appear after a molecule with virtual
-        sites therefore have their OpenMM particle indices shifted relative
-        to their Sire atom indices.
-
-        Parameters
-        ----------
-
-        system: sire.system.System
-            The molecular system.
-
-        Returns
-        -------
-
-        total_vsites: int
-            Total number of virtual site particles in the system.
-
-        atom_offsets: numpy.ndarray
-            Array of shape (num_sire_atoms,) where entry i is the
-            cumulative number of virtual sites in all molecules that
-            precede the molecule containing Sire atom i. Adding this
-            offset to a Sire atom index yields the corresponding OpenMM
-            particle index.
-
-        mol_vsite_charges: dict
-            Mapping from molecule number to a list of virtual site charges in
-            units of elementary charge. Only molecules that carry virtual sites
-            appear as keys; all other molecules are absent from the dict.
-        """
-        n_sire_atoms = system.num_atoms()
-        atom_offsets = _np.zeros(n_sire_atoms, dtype=_np.int32)
-        mol_vsite_charges = {}
-        total_vsites = 0
-
-        try:
-            vsite_mols = system["property n_virtual_sites"].molecules()
-        except Exception:
-            # No molecules carry virtual sites.
-            return 0, atom_offsets, mol_vsite_charges
-
-        all_atoms = system.atoms()
-
-        for mol in vsite_mols:
-            n_vs = int(mol.property("n_virtual_sites"))
-            if n_vs <= 0:
-                continue
-
-            # Locate where this molecule's atoms sit in the global index space,
-            # then shift every subsequent atom's offset by n_vs in one operation.
-            mol_start = int(_np.array(all_atoms.find(mol.atoms()))[0])
-            mol_end = mol_start + mol.num_atoms()
-            atom_offsets[mol_end:] += n_vs
-            total_vsites += n_vs
-
-            try:
-                raw_charges = mol.property("vs_charges")
-                vs_charges = [float(raw_charges[k]) for k in range(n_vs)]
-            except Exception:
-                vs_charges = [0.0] * n_vs
-
-            mol_vsite_charges[mol.number()] = vs_charges
-
-        return total_vsites, atom_offsets, mol_vsite_charges
-
-    @staticmethod
-    def _get_reference_indices(system, reference):
-        """
-        Get the indices of the reference atoms.
-
-        Parameters
-        ----------
-
-        system: sire.system.System
-            The molecular system.
-
-        reference: str
-            A selection string for the reference atoms.
-
-        Returns
-        -------
-
-        indices: numpy.ndarray
-            The indices of the reference atoms.
-        """
-
-        # Get the atoms in the reference selection.
-        try:
-            atoms = system[reference].atoms()
-        except Exception as e:
-            raise ValueError(f"Could not get the reference atoms: {e}")
-
-        # Get the indices of the reference atoms.
-        indices = _np.array(system.atoms().find(atoms))
-
-        return indices
-
-    @staticmethod
-    def _prepare_system(system, water_template, rng, num_ghost_waters):
-        """
-        Prepare the system for GCMC sampling.
-
-        Parameters
-        ----------
-
-        system: sire.system.System
-            The molecular system.
-
-        water_template: sire.molecule.Molecule
-            The water template.
-
-        rng: numpy.random.Generator
-            The random number generator.
-
-        num_ghost_waters: int
-            The maximum number of GCMC waters to insert.
-
-        Returns
-        -------
-
-        system: sire.system.System
-            The prepared system.
-
-        water_indices: numpy.ndarray
-            The indices of the oxygen atoms in each water molecule.
-
-        water_residues: numpy.ndarray
-            The indices of the water residues.
-        """
-
-        # Get the space property from the system.
-        try:
-            space = system.property("space")
-        except Exception:
-            raise ValueError("'system' must contain a 'space' property")
-
-        # Get the box matrix and diagonal.
-        box_matrix = space.box_matrix()
-        box = _np.array([box_matrix.xx(), box_matrix.yy(), box_matrix.zz()])
-
-        # Edit the template so that it is non-interacting.
-        cursor = water_template.cursor()
-        for atom in cursor.atoms():
-            atom["charge"] = 0.0 * _sr.units.mod_electron
-            atom["LJ"] = _sr.legacy.MM.LJParameter(
-                atom["LJ"].sigma(), 0.0 * _sr.units.kcal_per_mol
-            )
-        water_template = _BSS._SireWrappers.Molecule(cursor.commit())
-
-        # Create a BioSimSpace system.
-        bss_system = _BSS._SireWrappers.System(system._system)
-
-        # Get the initial positions of the atoms.
-        positions = _sr.io.get_coords_array(water_template._sire_object)
-
-        # Create the GCMC waters.
-        waters = []
-        for i in range(num_ghost_waters):
-            # Create a copy of the water template with a new molecule number.
-            water = water_template.copy()
-
-            # Make the water editable.
-            cursor = water._sire_object.cursor()
-
-            # Work out the new position for the oxygen atom.
-            oxygen = rng.random(3) * box
-
-            # Loop over the atoms and update the positions.
-            for j, atom in enumerate(cursor.atoms()):
-                new_position = positions[j] + oxygen - positions[0]
-                atom["coordinates"] = _sr.maths.Vector(*new_position)
-
-            # Commit the changes to the water.
-            water._sire_object = cursor.commit()
-
-            # Append the water to the list.
-            waters.append(water)
-
-        # Add the waters to the system.
-        bss_system += waters
-
-        # Search for the water oxygen atoms and their residues.
-        water_indices = []
-        water_residues = []
-        for atom in bss_system.search(
-            "(water and not property is_perturbable) and element O"
-        ).atoms():
-            water_indices.append(bss_system.getIndex(atom))
-            water_residues.append(
-                bss_system.getIndex(
-                    _BSS._SireWrappers.Residue(atom._sire_object.residue())
+        # Extract template type indices from the CustomNonbondedForce.
+        template_atom_ids = [a.id for a in all_gcmc_residues[0].atoms]
+        self._template_type_indices = None
+        for force in self.omm_system.getForces():
+            if isinstance(force, _openmm.CustomNonbondedForce):
+                self._template_type_indices = _np.array(
+                    [int(force.getParticleParameters(aid)[0]) for aid in template_atom_ids],
+                    dtype=_np.int32,
                 )
-            )
+                break
 
-        return (
-            _sr.system.System(bss_system._sire_object),
-            _np.array(water_indices),
-            _np.array(water_residues),
-        )
+        # Set NonbondedForce method.
+        for force in self.omm_system.getForces():
+            if isinstance(force, _openmm.NonbondedForce):
+                if self._is_pme:
+                    force.setNonbondedMethod(_openmm.NonbondedForce.PME)
+                else:
+                    force.setNonbondedMethod(_openmm.NonbondedForce.CutoffPeriodic)
+
+        # Patch CustomNonbondedForce expression for NaN prevention with ghost overlaps.
+        self._use_lrc = False
+        for force in self.omm_system.getForces():
+            if isinstance(force, _openmm.CustomNonbondedForce):
+                if force.getUseLongRangeCorrection():
+                    self._use_lrc = True
+                expr = force.getEnergyFunction()
+                if 'invR6*invR6' in expr and '1/r^6' in expr:
+                    patched = ('select(A(type1,type2)+B(type1,type2),'
+                              'A(type1,type2)*invR6*invR6-B(type1,type2)*invR6,0);'
+                              'invR6=1/r^6')
+                    force.setEnergyFunction(patched)
+
+        # PME: LRC is included in the OpenMM full-energy correction step.
+        if self._use_lrc and not self._is_pme:
+            self._compute_gcmc_lrc(target_residues, topology)
+        else:
+            self._lrc_w_solute = 0.0
+            self._lrc_ww_half = 0.0
+
+        # --- Find NonbondedForce and CustomNonbondedForce ---
+        self._nonbonded_force = None
+        self._custom_nb_forces = []
+        for force in self.omm_system.getForces():
+            if isinstance(force, _openmm.NonbondedForce):
+                self._nonbonded_force = force
+            elif isinstance(force, _openmm.CustomNonbondedForce):
+                self._custom_nb_forces.append(force)
+
+        if self._nonbonded_force is None:
+            raise ValueError("No NonbondedForce found in the OpenMM system")
+        nonbonded = self._nonbonded_force
+
+        # --- Enlarge Discrete2DFunction tables to add ghost type ---
+        self._ghost_type_index = None
+        for cnb in self._custom_nb_forces:
+            for func_idx in range(cnb.getNumTabulatedFunctions()):
+                func = cnb.getTabulatedFunction(func_idx)
+                if isinstance(func, _openmm.Discrete2DFunction):
+                    xsize, ysize, _ = func.getFunctionParameters()
+                    self._ghost_type_index = xsize
+                    break
+            if self._ghost_type_index is not None:
+                break
+
+        if self._ghost_type_index is None:
+            raise ValueError("No Discrete2DFunction found in CustomNonbondedForce")
+
+        n_new = self._ghost_type_index + 1
+        for cnb in self._custom_nb_forces:
+            for func_idx in range(cnb.getNumTabulatedFunctions()):
+                func = cnb.getTabulatedFunction(func_idx)
+                if isinstance(func, _openmm.Discrete2DFunction):
+                    xsize, ysize, old_values = func.getFunctionParameters()
+                    new_values = [0.0] * (n_new * n_new)
+                    for row in range(xsize):
+                        for col in range(ysize):
+                            new_values[row + n_new * col] = old_values[row + xsize * col]
+                    func.setFunctionParameters(n_new, n_new, new_values)
+
+        # --- Set ghost nonbonded parameters ---
+        ghost_residues = all_gcmc_residues[n_real_mols:]
+        for ghost_res in ghost_residues:
+            for atom in ghost_res.atoms:
+                nonbonded.setParticleParameters(atom.id, 0.0, 1.0, 0.0)
+                for cnb in self._custom_nb_forces:
+                    cnb.setParticleParameters(atom.id, [float(self._ghost_type_index)])
+
+        # --- Fix beyond-1-4 pairs for ALL GCMC molecules ---
+        # Makes intramolecular energy constant regardless of ghost/real state.
+        dist_matrix = template_mol.get_distance_matrix(max_bond=3)
+        beyond_14_local = []
+        for i in range(template_mol.n_atom):
+            for j in range(i + 1, template_mol.n_atom):
+                if dist_matrix[i, j] == 0:
+                    beyond_14_local.append((i, j))
+
+        if beyond_14_local:
+            _logger.info(
+                f"Beyond-1-4 pairs per molecule: {len(beyond_14_local)}"
+            )
+            # Create CustomBondForce for beyond-1-4 LJ (same expression as mstk 1-4).
+            beyond_14_lj = _openmm.CustomBondForce(
+                'C*epsilon*((sigma/r)^n-(sigma/r)^m);'
+                'C=n/(n-m)*(n/m)^(m/(n-m))'
+            )
+            beyond_14_lj.addPerBondParameter('epsilon')
+            beyond_14_lj.addPerBondParameter('sigma')
+            beyond_14_lj.addPerBondParameter('n')
+            beyond_14_lj.addPerBondParameter('m')
+            beyond_14_lj.setUsesPeriodicBoundaryConditions(True)
+            beyond_14_lj.setName('Beyond14LJ')
+
+            for res in all_gcmc_residues:
+                for (li, lj) in beyond_14_local:
+                    # Get VdW parameters for this pair from the force field.
+                    atom_i = res.atoms[li]
+                    atom_j = res.atoms[lj]
+                    ai = atom_i.id
+                    aj = atom_j.id
+                    vdw = self._ff.get_vdw_term(
+                        self._ff.atom_types[atom_i.type],
+                        self._ff.atom_types[atom_j.type]
+                    )
+                    beyond_14_lj.addBond(
+                        ai, aj, [vdw.epsilon, vdw.sigma, 12, 6]
+                    )
+                    # Add as exception in NonbondedForce (constant chargeProd).
+                    chg_prod = atom_i.charge * atom_j.charge
+                    nonbonded.addException(ai, aj, chg_prod, 1.0, 0.0)
+                    # Add as exclusion in CustomNonbondedForce.
+                    for cnb in self._custom_nb_forces:
+                        cnb.addExclusion(ai, aj)
+
+            self.omm_system.addForce(beyond_14_lj)
+
+        # --- Spread ghost molecule positions to avoid numerical overlap ---
+        box_size = _np.array(topology.cell.get_size())
+        rng = _np.random.default_rng(self._seed)
+        for ghost_res in ghost_residues:
+            origin = rng.random(3) * box_size
+            for atom in ghost_res.atoms:
+                extended_top.atoms[atom.id].position = origin + template_positions_nm[atom.id_in_mol]
+
+        # --- Build water_indices and positions ---
+        water_indices = []
+        for res in all_gcmc_residues:
+            water_indices.append(res.atoms[0].id)
+
+        self._water_indices = _np.array(water_indices, dtype=_np.int32)
+        self._num_waters = len(self._water_indices)
+        self._num_atoms = self.omm_system.getNumParticles()
+
+        # Store extended system reference for _initialise_gpu_memory.
+        self._extended_system = extended_system
+        self.topology = extended_top
+
+
 
     def _initialise_gpu_memory(self):
-        """
-        Initialise the GPU memory.
-        """
+        """Upload per-atom parameters and allocate GPU buffers."""
+        n_total = self._num_atoms
 
-        # First get the atomic properties.
+        # Per-atom arrays.
+        charges = _np.zeros(n_total, dtype=_np.float32)
+        sigmas = _np.zeros(n_total, dtype=_np.float32)
+        epsilons = _np.zeros(n_total, dtype=_np.float32)
 
-        # If this is a regular system, then we can just get the properties directly.
-        if not self._is_fep:
-            # Get the charges on all the atoms.
-            try:
-                charges = _np.zeros(self._num_atoms, dtype=_np.float32)
-                i = 0
-                for mol in self._system:
-                    for q in mol.property("charge"):
-                        charges[i] = q.value()
-                        i += 1
-                    # Append virtual site charges (zero LJ, non-zero charge).
-                    for vc in self._mol_vsite_charges.get(mol.number(), []):
-                        charges[i] = vc
-                        i += 1
+        # Fill all atoms (real + ghost) from extended system.
+        for atom in self.topology.atoms:
+            charges[atom.id] = atom.charge
+            vdw = self._extended_system.atom_vdw_terms[atom]
+            sigmas[atom.id] = vdw.sigma * 10.0  # nm → Å
+            epsilons[atom.id] = vdw.epsilon / 4.184  # kJ/mol → kcal/mol
 
-                # Convert to a GPU array.
-                charges = self._backend.to_gpu(charges.astype(_np.float32))
+        # Zero ghost atoms' charge and epsilon (sigma kept for insertion).
+        n_real_waters = self._num_waters - self._num_ghost_waters
+        for i in range(self._num_ghost_waters):
+            start = self._water_indices[n_real_waters + i]
+            for j in range(self._num_points):
+                charges[start + j] = 0.0
+                epsilons[start + j] = 0.0
 
-            except Exception as e:
-                raise ValueError(f"Could not get the charges on the atoms: {e}")
+        # Upload to GPU.
+        self._gpu_charge = self._backend.to_gpu(charges)
+        self._gpu_sigma = self._backend.to_gpu(sigmas)
+        self._gpu_epsilon = self._backend.to_gpu(epsilons)
 
-            # Try to get the sigma and epsilon for the atoms.
-            try:
-                sigmas = _np.zeros(self._num_atoms, dtype=_np.float32)
-                epsilons = _np.zeros(self._num_atoms, dtype=_np.float32)
-                i = 0
-                for mol in self._system:
-                    for lj in mol.property("LJ"):
-                        sigmas[i] = lj.sigma().value()
-                        epsilons[i] = lj.epsilon().value()
-                        i += 1
-                    # Virtual sites have zero LJ. Use sigma=1.0 Å as a
-                    # nominal placeholder (epsilon=0 so it has no effect).
-                    for _ in self._mol_vsite_charges.get(mol.number(), []):
-                        sigmas[i] = 1.0
-                        epsilons[i] = 0.0
-                        i += 1
+        # Water template parameters (in Å and kcal/mol).
+        self._gpu_charge_water = self._backend.to_gpu(
+            self._water_charge.astype(_np.float32)
+        )
+        self._gpu_sigma_water = self._backend.to_gpu(
+            self._water_sigma.astype(_np.float32)
+        )
+        self._gpu_epsilon_water = self._backend.to_gpu(
+            self._water_epsilon.astype(_np.float32)
+        )
 
-                # Convert to GPU arrays.
-                sigmas = self._backend.to_gpu(sigmas.astype(_np.float32))
-                epsilons = self._backend.to_gpu(epsilons.astype(_np.float32))
+        # Water state: 0=ghost, 1=real.
+        water_state = _np.ones(self._num_waters, dtype=_np.int32)
+        is_ghost_water = _np.zeros(n_total, dtype=_np.int32)
+        for i in range(self._num_ghost_waters):
+            idx = n_real_waters + i
+            water_state[idx] = 0
+            start = self._water_indices[idx]
+            for j in range(self._num_points):
+                is_ghost_water[start + j] = 1
 
-            except Exception as e:
-                raise ValueError(f"Could not get the LJ parameters: {e}")
+        self._water_state = water_state
 
-            # Set the alphas to zero.
-            alphas = self._backend.to_gpu(_np.zeros(self._num_atoms, dtype=_np.float32))
+        self._gpu_is_ghost_water = self._backend.to_gpu(is_ghost_water.astype(_np.int32))
+        self._gpu_water_idx = self._backend.to_gpu(self._water_indices.astype(_np.int32))
+        self._gpu_water_state = self._backend.to_gpu(self._water_state.astype(_np.int32))
 
-            # Set the is_ghost_fep array to zero.
-            is_ghost_fep = self._backend.to_gpu(
-                _np.zeros(self._num_atoms, dtype=_np.int32)
-            )
-
-        # Otherwise, we need to create an OpenMM context using the specified lambda
-        # schedule and value, then extract the required properties from the forces
-        # within the context. (The system just contains the end-state properties.)
-        else:
-            # Link to the reference state.
-            mols = _sr.morph.link_to_reference(self._system)
-
-            # Build map of extra options for the dynamics object.
-            _map = {}
-            if self._softcore_form == _SoftcoreForm.TAYLOR:
-                _map["use_taylor_softening"] = True
-                _map["taylor_power"] = self._taylor_power
-            elif self._softcore_form == _SoftcoreForm.BEUTLER:
-                _map["use_beutler_softening"] = True
-                _map["beutler_alpha"] = self._beutler_alpha
-
-            # Create a dynamics object.
-            d = mols.dynamics(
-                cutoff_type=self._cutoff,
-                cutoff=self._cutoff,
-                lambda_value=self._lambda_value,
-                schedule=self._lambda_schedule,
-                pressure=None,
-                timestep="2fs",
-                constraint="h_bonds",
-                perturbable_constraint="h_bonds_not_heavy_perturbed",
-                rest2_scale=self._rest2_scale,
-                rest2_selection=self._rest2_selection,
-                swap_end_states=self._swap_end_states,
-                platform="cpu",
-                map=_map,
-            )
-
-            # Flag for the required force.
-            has_gng = False
-
-            # Find the required forces.
-            for force in d.context().getSystem().getForces():
-                if force.getName() == "GhostNonGhostNonbondedForce":
-                    gng_force = force
-                    has_gng = True
-                    break
-
-            # Make sure the force was found.
-            if not has_gng:
-                raise ValueError(
-                    "Could not find the GhostNonGhostNonbondedForce in the system"
-                )
-
-            # Get the parameters for the GhostNonGhostNonbondedForce.
-            charges = _np.zeros(self._num_atoms, dtype=_np.float32)
-            sigmas = _np.zeros(self._num_atoms, dtype=_np.float32)
-            epsilons = _np.zeros(self._num_atoms, dtype=_np.float32)
-            alphas = _np.zeros(self._num_atoms, dtype=_np.float32)
-            for i in range(gng_force.getNumParticles()):
-                # Custom force parameters are returned as floats.
-                q, half_sigma, two_sqrt_epsilon, alpha, _ = (
-                    gng_force.getParticleParameters(i)
-                )
-                # Charge in |e|, sigma in nm, epsilon in kJ/mol.
-                charges[i] = q
-                # Rescale and convert units.
-                sigmas[i] = _sr.u(f"{2.0 * half_sigma} nm").to("angstrom")
-                epsilons[i] = _sr.u(f"{(0.5 * two_sqrt_epsilon) ** 2} kJ/mol").to(
-                    "kcal/mol"
-                )
-                # Store the softening parameter.
-                alphas[i] = alpha
-
-            # Convert to GPU arrays.
-            charges = self._backend.to_gpu(charges.astype(_np.float32))
-            sigmas = self._backend.to_gpu(sigmas.astype(_np.float32))
-            epsilons = self._backend.to_gpu(epsilons.astype(_np.float32))
-            alphas = self._backend.to_gpu(alphas.astype(_np.float32))
-
-            # Create the ghost atom array.
-            is_ghost_fep = _np.zeros(self._num_atoms, dtype=_np.int32)
-
-            # Get the atoms in the system.
-            atoms = self._system.atoms()
-
-            # Loop over all perturbable molecules.
-            for mol in self._system["property is_perturbable"].molecules():
-                # Loop over all atoms in the molecule.
-                for atom in mol.atoms():
-                    # Get the end-state charge.
-                    charge0 = atom.property("charge0").value()
-                    charge1 = atom.property("charge1").value()
-
-                    # The charge at the reference state is zero.
-                    if _np.isclose(charge0, 0.0):
-                        # Get the end-state LJ parameters.
-                        lj = atom.property("LJ0")
-
-                        # This is a null LJ parameter.
-                        if _np.isclose(lj.epsilon().value(), 0.0):
-                            sire_idx = atoms.find(atom)
-                            omm_idx = sire_idx + int(self._vsite_atom_offsets[sire_idx])
-                            is_ghost_fep[omm_idx] = 1
-
-                    # The charge at the perturbed state is zero.
-                    elif _np.isclose(charge1, 0.0):
-                        # Get the end-state LJ parameters.
-                        lj = atom.property("LJ1")
-
-                        # This is a null LJ parameter.
-                        if _np.isclose(lj.epsilon().value(), 0.0):
-                            sire_idx = atoms.find(atom)
-                            omm_idx = sire_idx + int(self._vsite_atom_offsets[sire_idx])
-                            is_ghost_fep[omm_idx] = 1
-
-            # Convert to GPU array.
-            is_ghost_fep = self._backend.to_gpu(is_ghost_fep.astype(_np.int32))
-
-        # Get the water properties.
-        try:
-            charge_water = []
-            sigma_water = []
-            epsilon_water = []
-            for atom in self._water_template.atoms():
-                charge_water.append(atom.charge().value())
-                lj = atom.property("LJ")
-                sigma_water.append(lj.sigma().value())
-                epsilon_water.append(lj.epsilon().value())
-
-            # Store the water properties.
-            self._water_charge = _np.array(charge_water)
-            self._water_sigma = _np.array(sigma_water)
-            self._water_epsilon = _np.array(epsilon_water)
-
-            # Convert sigma and epsilon for use in custom forces.
-            # These are half-sigma in nanometers and 2 * sqrt(epsilon) in kJ/mol.
-            self._water_sigma_custom = 0.05 * self._water_sigma
-            self._water_epsilon_custom = 2.0 * _np.sqrt(4.184 * self._water_epsilon)
-
-            # Convert to GPU arrays.
-            charge_water = self._backend.to_gpu(self._water_charge.astype(_np.float32))
-            sigma_water = self._backend.to_gpu(self._water_sigma.astype(_np.float32))
-            epsilon_water = self._backend.to_gpu(
-                self._water_epsilon.astype(_np.float32)
-            )
-
-        except Exception as e:
-            raise ValueError(f"Could not get the atomic properties of the water: {e}")
-
-        # Initialise the water state: 0 = ghost, 1 = real.
-        water_state = []
-        is_ghost_water = _np.zeros(self._num_atoms, dtype=_np.int32)
-        for i in range(self._num_waters):
-            if i < self._num_waters - self._num_ghost_waters:
-                water_state.append(1)
-            else:
-                water_state.append(0)
-                for j in range(self._num_points):
-                    is_ghost_water[self._water_indices[i] + j] = 1
-        self._water_state = _np.array(water_state).astype(_np.int32)
-
-        # Initialize water index caches (invalidated when water_state changes).
-        self._ghost_waters_cache = None
-        self._non_ghost_waters_cache = None
-        self._invalidate_water_caches()
-
-        # Pre-allocate zero target array for bulk sampling.
-        self._zero_target_gpu = self._backend.to_gpu(_np.zeros(3, dtype=_np.float32))
-
-        # Compute reaction field parameters on host.
-        cutoff_val = self._cutoff.value()
-        self._rf_cutoff = _np.float32(cutoff_val)
+        # Reaction field parameters (in Å).
+        cutoff_ang = self._cutoff * 10.0
+        self._rf_cutoff = _np.float32(cutoff_ang)
         self._rf_kappa = _np.float32(
-            (78.3 - 1.0) / ((2.0 * 78.3 + 1.0) * cutoff_val**3)
+            (78.3 - 1.0) / ((2.0 * 78.3 + 1.0) * cutoff_ang ** 3)
         )
         self._rf_correction = _np.float32(
-            1.0 / cutoff_val + float(self._rf_kappa) * cutoff_val**2
+            1.0 / cutoff_ang + float(self._rf_kappa) * cutoff_ang ** 2
         )
 
-        # Store soft-core parameters as scalars.
-        self._sc_softcore_form = _np.int32(int(self._softcore_form))
-        self._sc_shift_coulomb = _np.float32(self._shift_coulomb.value())
-        self._sc_shift_delta = _np.float32(self._shift_delta.value())
-        self._sc_taylor_power = _np.int32(self._taylor_power)
-        self._sc_beutler_alpha = _np.float32(self._beutler_alpha)
-
-        # Store immutable per-atom buffers on GPU.
-        self._gpu_sigma = sigmas
-        self._gpu_epsilon = epsilons
-        self._gpu_charge = charges
-        self._gpu_alpha = alphas
-        self._gpu_is_ghost_water = self._backend.to_gpu(
-            is_ghost_water.astype(_np.int32)
-        )
-        self._gpu_is_ghost_fep = is_ghost_fep
-
-        # Store immutable water property buffers on GPU.
-        self._gpu_charge_water = charge_water
-        self._gpu_sigma_water = sigma_water
-        self._gpu_epsilon_water = epsilon_water
-        self._gpu_water_idx = self._backend.to_gpu(
-            self._water_indices.astype(_np.int32)
-        )
-        self._gpu_water_state = self._backend.to_gpu(
-            self._water_state.astype(_np.int32)
-        )
-
-        # Allocate mutable position buffer (will be filled before each move).
-        self._gpu_position = self._backend.empty((1, self._num_atoms * 3), _np.float32)
-
-        # Initialise the memory to store the water positions.
+        # Allocate mutable buffers.
+        self._gpu_position = self._backend.empty((1, n_total * 3), _np.float32)
         self._water_positions = self._backend.empty(
             (1, self._batch_size * 3 * self._num_points), _np.float32
         )
-
-        # Initialise memory to store the energy.
         self._energy_coul = self._backend.empty(
-            (1, self._batch_size * self._num_atoms), _np.float32
+            (1, self._batch_size * n_total), _np.float32
         )
         self._energy_lj = self._backend.empty(
-            (1, self._batch_size * self._num_atoms), _np.float32
+            (1, self._batch_size * n_total), _np.float32
         )
-
-        # Initialise memory to store whether each attempt is accepted and
-        # the probability of acceptance.
         self._accepted = self._backend.empty((1, self._batch_size), _np.int32)
         self._energy_change = self._backend.empty((1, self._batch_size), _np.float32)
         self._probability = self._backend.empty((1, self._batch_size), _np.float32)
+        self._deletion_candidates = self._backend.empty((1, self._num_waters), _np.int32)
 
-        # Initialise memory to store the deletion candidates.
-        self._deletion_candidates = self._backend.empty(
-            (1, self._num_waters), _np.int32
+
+    def _compute_gcmc_lrc(self, target_residues, topology):
+        """
+        Precompute GCMC LRC coefficients from atom VdW parameters.
+
+        Computes lrc_w_solute (interaction of one water molecule with all solute
+        atoms) and lrc_ww_half (half the interaction between a pair of water
+        molecules). Units: kJ/mol*nm^3 (divide by V in nm^3 to get energy).
+
+        The standard LJ tail correction for pair (i,j) is:
+          LRC_ij = (8/3)*pi*eps_ij * [sigma_ij^12/(9*rc^9) - sigma_ij^6/(3*rc^3)]
+        which equals:
+          LRC_ij = (8/3)*pi*eps_ij*sigma_ij^6 * [sigma_ij^6/(9*rc^9) - 1/(3*rc^3)]
+        """
+        rc = self._cutoff  # nm
+        rc3 = rc ** 3
+        rc9 = rc3 ** 3
+
+        # Build water atom classes from template (works for both wet and dry systems).
+        # Template params are stored in Å / kcal/mol; convert back to nm / kJ/mol.
+        water_class_counts = {}
+        for i in range(self._num_points):
+            sig = self._water_sigma[i] / 10.0  # Å → nm
+            eps = self._water_epsilon[i] * 4.184  # kcal/mol → kJ/mol
+            if eps > 0:
+                key = (sig, eps)
+                water_class_counts[key] = water_class_counts.get(key, 0) + 1
+
+        # Identify water atom indices in the topology (for solute classification).
+        water_atom_ids = set()
+        for res in target_residues:
+            for atom in res.atoms:
+                water_atom_ids.add(atom.id)
+
+        n_water_mols = max(len(target_residues), 1)
+        _logger.info(f"GCMC LRC: {n_water_mols} water mols, {sum(water_class_counts.values())} water atom types")
+
+        # Collect (sigma, epsilon) per atom from mstk — solute only.
+        solute_class_counts = {}
+        n_solute_atoms = 0
+        for atom in topology.atoms:
+            if atom.id in water_atom_ids:
+                continue
+            vdw = self._system.atom_vdw_terms.get(atom)
+            if vdw is not None and vdw.epsilon > 0:
+                key = (vdw.sigma, vdw.epsilon)
+                solute_class_counts[key] = solute_class_counts.get(key, 0) + 1
+                n_solute_atoms += 1
+        _logger.info(f"GCMC LRC: {n_solute_atoms} solute atoms with eps>0")
+
+        # Combining rule: 0 = arithmetic sigma, 1 = geometric sigma.
+        # Epsilon always uses geometric mean.
+        def combine(sig_i, eps_i, sig_j, eps_j):
+            if self._combining_rule == 0:
+                sig_ij = 0.5 * (sig_i + sig_j)
+            else:
+                sig_ij = (sig_i * sig_j) ** 0.5
+            eps_ij = (eps_i * eps_j) ** 0.5
+            return sig_ij, eps_ij
+
+        def lrc_pair(sig_ij, eps_ij):
+            sig6 = sig_ij ** 6
+            return 16.0 * _np.pi * eps_ij * sig6 * (sig6 / (9.0 * rc9) - 1.0 / (3.0 * rc3))
+
+        # lrc_ww_half: half the LRC for one water-molecule pair.
+        # water_class_counts is per-molecule (from template).
+        water_classes = list(water_class_counts.items())
+        lrc_ww = 0.0
+        for i, ((sig_i, eps_i), n_i) in enumerate(water_classes):
+            for j in range(i, len(water_classes)):
+                (sig_j, eps_j), n_j = water_classes[j]
+                sig_ij, eps_ij = combine(sig_i, eps_i, sig_j, eps_j)
+                pair_lrc = lrc_pair(sig_ij, eps_ij)
+                if i == j:
+                    lrc_ww += n_i * n_j * pair_lrc
+                else:
+                    lrc_ww += 2.0 * n_i * n_j * pair_lrc
+        self._lrc_ww_half = 0.5 * lrc_ww
+
+        # lrc_w_solute: LRC of one water molecule with all solute atoms.
+        lrc_w_solute = 0.0
+        for (sig_w, eps_w), n_w in water_classes:
+            for (sig_s, eps_s), n_s in solute_class_counts.items():
+                sig_ij, eps_ij = combine(sig_w, eps_w, sig_s, eps_s)
+                pair_lrc = lrc_pair(sig_ij, eps_ij)
+                lrc_w_solute += n_w * n_s * pair_lrc
+        self._lrc_w_solute = lrc_w_solute
+
+        _logger.info(
+            f"GCMC LRC: lrc_w_solute={self._lrc_w_solute:.6f}, "
+            f"lrc_ww_half={self._lrc_ww_half:.6f}"
         )
 
-    def _init_gcmc_lrc(self, context):
-        """Detect and cache GCMC LRC parameters from the OpenMM context."""
-        try:
-            self._lrc_w_solute = context.getParameter("lrc_w_solute")
-            self._lrc_ww_half = context.getParameter("lrc_ww_half")
-            self._has_gcmc_lrc = True
-        except Exception:
-            self._has_gcmc_lrc = False
-
-    def _accept_insertion(
-        self, idx, idx_water, positions_openmm, positions_angstrom, context
-    ):
-        """
-        Accept a insertion move.
-
-        Parameters
-        ----------
-
-        idx: int
-            The index of the accepted state.
-
-        idx_water: int
-            The index of the ghost water to use for the insertion.
-
-        positions_openmm: numpy.ndarray
-            The positions of the atoms in the system in OpenMM units.
-
-        positions_angstrom: numpy.ndarray
-            The positions of the atoms in the system in Angstroms.
-
-        context: openmm.Context
-            The OpenMM context to update.
-        """
-
-        # Get the new water positions.
+    def _accept_insertion(self, idx, idx_water, positions_openmm, positions_angstrom, context):
+        """Accept an insertion move."""
         water_positions = self._backend.from_gpu(self._water_positions).reshape(
             (self._batch_size, self._num_points, 3)
         )[idx]
 
-        # Update the water state.
         self._water_state[idx_water] = 1
-        self._invalidate_water_caches()
 
-        # Get the starting atom index.
         start_idx = self._water_indices[idx_water]
 
-        # Update the water positions and NonBondedForce.
         for i in range(self._num_points):
-            # Update the water positions.
             positions_openmm[start_idx + i] = _openmm.unit.Quantity(
                 water_positions[i], _openmm.unit.angstrom
             )
             positions_angstrom[start_idx + i] = water_positions[i]
-            # Update the NonBondedForce parameters.
+            # Restore charge (NonbondedForce handles Coulomb only).
             self._nonbonded_force.setParticleParameters(
                 start_idx + i,
                 self._water_charge[i] * _openmm.unit.elementary_charge,
-                self._water_sigma[i] * _openmm.unit.angstrom,
-                self._water_epsilon[i] * _openmm.unit.kilocalories_per_mole,
+                1.0 * _openmm.unit.nanometer,
+                0.0 * _openmm.unit.kilojoules_per_mole,
             )
-            # Update the custom NonBondedForce parameters.
-            if self._is_fep:
-                self._custom_nonbonded_force.setParticleParameters(
-                    start_idx + i,
-                    (
-                        self._water_charge[i],
-                        self._water_sigma_custom[i],
-                        self._water_epsilon_custom[i],
-                        0.0,
-                        0.0,
-                    ),
-                )
-
-        # Set the new positions.
-        context.setPositions(positions_openmm)
-
-        # Update the NonbondedForce parameters in the context.
         self._nonbonded_force.updateParametersInContext(context)
 
-        # Update the CustomNonbondedForce parameters in the context.
-        if self._is_fep:
-            self._custom_nonbonded_force.updateParametersInContext(context)
+        for cnb in self._custom_nb_forces:
+            for i in range(self._num_points):
+                cnb.setParticleParameters(
+                    start_idx + i, [float(self._template_type_indices[i])]
+                )
+            cnb.updateParametersInContext(context)
 
-        # Update the state of the water on the GPU.
+        context.setPositions(positions_openmm)
+
+        # Update GPU arrays.
         self._kernels["update_water"](
             _np.int32(self._num_points),
             _np.int32(idx_water),
@@ -2484,60 +1300,31 @@ class GCMCSampler:
             grid=(1, 1, 1),
         )
 
-        # Update the number of waters in the sampling volume.
         self._N += 1
 
-        # Update the GCMC LRC water count in the context.
-        if self._has_gcmc_lrc:
-            context.setParameter("n_w", context.getParameter("n_w") + 1.0)
 
     def _accept_deletion(self, idx, context):
-        """
-        Accept a deletion move.
-
-        Parameters
-        ----------
-
-        idx: int
-            The index of the deleted water.
-
-        context: openmm.Context
-            The OpenMM context to update.
-        """
-
-        # Update the water state.
+        """Accept a deletion move."""
         self._water_state[idx] = 0
-        self._invalidate_water_caches()
 
-        # Get the starting atom index.
         start_idx = self._water_indices[idx]
 
+        # Zero charge (NonbondedForce handles Coulomb only).
         for i in range(self._num_points):
-            # Update the NonBondedForce parameters.
             self._nonbonded_force.setParticleParameters(
-                start_idx + i, 0.0, self._water_sigma[i] * _openmm.unit.angstrom, 0.0
+                start_idx + i, 0.0, 1.0 * _openmm.unit.nanometer,
+                0.0 * _openmm.unit.kilojoules_per_mole,
             )
-            # Update the CustomNonBondedForce parameters.
-            if self._is_fep:
-                self._custom_nonbonded_force.setParticleParameters(
-                    start_idx + i,
-                    (
-                        0.0,
-                        self._water_sigma_custom[i],
-                        0.0,
-                        0.0,
-                        0.0,
-                    ),
-                )
-
-        # Update the NonbondedForce parameters in the context.
         self._nonbonded_force.updateParametersInContext(context)
 
-        # Update the CustomNonbondedForce parameters in the context.
-        if self._is_fep:
-            self._custom_nonbonded_force.updateParametersInContext(context)
+        # Set ghost type in CustomNonbondedForces (LJ).
+        for cnb in self._custom_nb_forces:
+            for i in range(self._num_points):
+                cnb.setParticleParameters(
+                    start_idx + i, [float(self._ghost_type_index)]
+                )
+            cnb.updateParametersInContext(context)
 
-        # Update the state of the water on the GPU.
         self._kernels["update_water"](
             _np.int32(self._num_points),
             _np.int32(idx),
@@ -2558,63 +1345,33 @@ class GCMCSampler:
             grid=(1, 1, 1),
         )
 
-        # Update the number of waters in the sampling volume.
         self._N -= 1
 
-        # Update the GCMC LRC water count in the context.
-        if self._has_gcmc_lrc:
-            context.setParameter("n_w", context.getParameter("n_w") - 1.0)
 
     def _reject_deletion(self, idx, context):
-        """
-        Reject a deletion move.
-
-        Parameters
-        ----------
-
-        idx: int
-            The index of the water.
-
-        context: openmm.Context
-            The OpenMM context to update.
-        """
-
-        # Reset the water state.
+        """Reject a deletion move (restore parameters)."""
         self._water_state[idx] = 1
-        self._invalidate_water_caches()
 
-        # Get the starting atom index.
         start_idx = self._water_indices[idx]
 
+        # Restore charge (NonbondedForce handles Coulomb only).
         for i in range(self._num_points):
-            # Update the NonBondedForce parameters.
             self._nonbonded_force.setParticleParameters(
                 start_idx + i,
                 self._water_charge[i] * _openmm.unit.elementary_charge,
-                self._water_sigma[i] * _openmm.unit.angstrom,
-                self._water_epsilon[i] * _openmm.unit.kilocalories_per_mole,
+                1.0 * _openmm.unit.nanometer,
+                0.0 * _openmm.unit.kilojoules_per_mole,
             )
-            # Update the CustomNonBondedForce parameters.
-            if self._is_fep:
-                self._custom_nonbonded_force.setParticleParameters(
-                    start_idx + i,
-                    (
-                        self._water_charge[i],
-                        self._water_sigma_custom[i],
-                        self._water_epsilon_custom[i],
-                        0.0,
-                        0.0,
-                    ),
-                )
-
-        # Update the NonbondedForce parameters in the context.
         self._nonbonded_force.updateParametersInContext(context)
 
-        # Update the CustomNonbondedForce parameters in the context.
-        if self._is_fep:
-            self._custom_nonbonded_force.updateParametersInContext(context)
+        # Restore real type in CustomNonbondedForces (LJ).
+        for cnb in self._custom_nb_forces:
+            for i in range(self._num_points):
+                cnb.setParticleParameters(
+                    start_idx + i, [float(self._template_type_indices[i])]
+                )
+            cnb.updateParametersInContext(context)
 
-        # Update the state of the water on the GPU.
         self._kernels["update_water"](
             _np.int32(self._num_points),
             _np.int32(idx),
@@ -2635,404 +1392,4 @@ class GCMCSampler:
             grid=(1, 1, 1),
         )
 
-        # Update the number of waters in the sampling volume.
         self._N += 1
-
-        # Update the GCMC LRC water count in the context.
-        if self._has_gcmc_lrc:
-            context.setParameter("n_w", context.getParameter("n_w") + 1.0)
-
-    def _set_water_state(self, context, indices=None, states=None, force=False):
-        """
-        Update the state for a list of waters. This can be used by external
-        packages when swapping OpenMM state between different replicas when
-        GCMC sampling.
-
-        Parameters
-        ----------
-
-        context: openmm.Context
-            The OpenMM context to update.
-
-        indices: np.array
-            The indices of the waters to update. If None, then all waters
-            are updated. Default: None.
-
-        states: np.array
-            The new states of the water. If None, then the states are set
-            to their current state. This is useful if the context has been
-            recreated externally, e.g. following a crash, so the water state
-            will have been lost. Default: None.
-
-        force: bool
-            If True, then update the state even if it is unchanged.
-            Default: False.
-        """
-
-        if indices is None:
-            # Update all waters.
-            indices = _np.arange(self._num_waters, dtype=_np.int32)
-
-        if states is None:
-            # Update all waters to their current state.
-            states = self._water_state[indices]
-            # Assume the context has been recreated, so we need to get the
-            # new forces.
-            self._nonbonded_force = None
-            self._custom_nonbonded_force = None
-            # Update even if the state is unchanged.
-            force = True
-
-        # Set the NonBondedForce(s).
-        self._set_nonbonded_forces(context)
-
-        # Loop over the indices and states.
-        for idx, state in zip(indices, states):
-            # Skip if the state is unchanged.
-            if not force and self._water_state[idx] == state:
-                continue
-
-            _logger.debug(f"Updating water {idx} to state {state}")
-
-            # Get the water starting index.
-            start_idx = self._water_indices[idx]
-
-            # Ghost water.
-            if state == 0:
-                for i in range(self._num_points):
-                    # Update the NonbondedForce parameters.
-                    self._nonbonded_force.setParticleParameters(
-                        start_idx + i,
-                        0.0,
-                        self._water_sigma[i] * _openmm.unit.angstrom,
-                        0.0,
-                    )
-                    # Update the CustomNonbondedForce parameters.
-                    if self._is_fep:
-                        self._custom_nonbonded_force.setParticleParameters(
-                            start_idx + i,
-                            (
-                                0.0,
-                                self._water_sigma_custom[i],
-                                0.0,
-                                0.0,
-                                0.0,
-                            ),
-                        )
-
-                # Update the state of the water on the GPU.
-                self._kernels["update_water"](
-                    _np.int32(self._num_points),
-                    _np.int32(idx),
-                    _np.int32(0),
-                    _np.int32(0),
-                    self._backend.to_gpu(
-                        _np.zeros((self._num_points, 3), dtype=_np.float32).flatten()
-                    ),
-                    self._gpu_position,
-                    self._gpu_charge,
-                    self._gpu_epsilon,
-                    self._gpu_is_ghost_water,
-                    self._gpu_water_state,
-                    self._gpu_water_idx,
-                    self._gpu_charge_water,
-                    self._gpu_epsilon_water,
-                    block=(1, 1, 1),
-                    grid=(1, 1, 1),
-                )
-
-                # Set the new water state.
-                self._water_state[idx] = 0
-
-            # Real water.
-            else:
-                for i in range(self._num_points):
-                    # Update the NonbondedForce parameters.
-                    self._nonbonded_force.setParticleParameters(
-                        start_idx + i,
-                        self._water_charge[i] * _openmm.unit.elementary_charge,
-                        self._water_sigma[i] * _openmm.unit.angstrom,
-                        self._water_epsilon[i] * _openmm.unit.kilocalories_per_mole,
-                    )
-                    # Update the CustomNonBondedForce parameters.
-                    if self._is_fep:
-                        self._custom_nonbonded_force.setParticleParameters(
-                            start_idx + i,
-                            (
-                                self._water_charge[i],
-                                self._water_sigma_custom[i],
-                                self._water_epsilon_custom[i],
-                                0.0,
-                                0.0,
-                            ),
-                        )
-
-                # Update the state of the water on the GPU.
-                self._kernels["update_water"](
-                    _np.int32(self._num_points),
-                    _np.int32(idx),
-                    _np.int32(1),
-                    _np.int32(0),
-                    self._backend.to_gpu(
-                        _np.zeros((self._num_points, 3), dtype=_np.float32).flatten()
-                    ),
-                    self._gpu_position,
-                    self._gpu_charge,
-                    self._gpu_epsilon,
-                    self._gpu_is_ghost_water,
-                    self._gpu_water_state,
-                    self._gpu_water_idx,
-                    self._gpu_charge_water,
-                    self._gpu_epsilon_water,
-                    block=(1, 1, 1),
-                    grid=(1, 1, 1),
-                )
-
-                # Set the new water state.
-                self._water_state[idx] = 1
-
-        # Invalidate water caches after all state updates.
-        self._invalidate_water_caches()
-
-        # Update the NonbondedForce parameters in the context.
-        self._nonbonded_force.updateParametersInContext(context)
-
-        # Update the CustomNonbondedForce parameters in the context.
-        if self._is_fep:
-            self._custom_nonbonded_force.updateParametersInContext(context)
-
-    def _set_nonbonded_forces(self, context):
-        """
-        Find the required nonbonded force(s) in the system.
-
-        Parameters
-        ----------
-
-        context: openmm.Context
-            The OpenMM context to use.
-        """
-        if self._nonbonded_force is None or (
-            self._is_fep and self._custom_nonbonded_force is None
-        ):
-            for force in context.getSystem().getForces():
-                if isinstance(force, _openmm.NonbondedForce):
-                    self._nonbonded_force = force
-                elif self._is_fep and force.getName() == "GhostNonGhostNonbondedForce":
-                    self._custom_nonbonded_force = force
-                elif "Barostat" in force.getName():
-                    msg = (
-                        f"GCMC must be used at constant volume: "
-                        f"'{force.getName()}' is not supported."
-                    )
-                    _logger.error(msg)
-                    raise TypeError(msg)
-
-        if self._nonbonded_force is None:
-            msg = "Could not find a NonbondedForce in the system"
-            _logger.error(msg)
-            raise ValueError(msg)
-
-        if self._is_fep and self._custom_nonbonded_force is None:
-            msg = "Could not find a CustomNonbondedForce in the system"
-            _logger.error(msg)
-            raise ValueError(msg)
-
-    def _get_target_position(self, positions):
-        """
-        Get the current centre of the GCMC sphere.
-
-        Parameters
-        ----------
-
-        positions: numpy.ndarray
-            The current positions of the system.
-
-        Returns
-        -------
-
-        target: numpy.ndarray
-            The centre of the GCMC sphere.
-        """
-
-        # Work out the centre of geometry of the reference atoms.
-        centre = _sr.maths.Vector(*positions[self._reference_indices[0]])
-        target = centre.__deepcopy__()
-        for index in self._reference_indices[1:]:
-            delta = self._space.calc_dist_vector(
-                target, _sr.maths.Vector(*positions[index])
-            )
-            centre += target + _sr.maths.Vector(delta.x(), delta.y(), delta.z())
-        target = _np.array([x.value() for x in centre / len(self._reference_indices)])
-
-        _logger.debug(f"GCMC sphere centre: {target}")
-
-        return target
-
-    def _log_insertion(self, idx, idx_water, pme_energy=None, pme_probability=None):
-        """
-        Log information about the accepted insertion move.
-
-        Parameters
-        ----------
-
-        idx: int
-            The index of the accepted trial move.
-
-        idx_water: int
-            The index of the water that was inserted.
-
-        pme_energy: openmm.Quantity
-            The PME energy difference.
-
-        pme_probability: float
-            The PME acceptance probability.
-        """
-        # Get the energies.
-        energy_coul = self._backend.from_gpu(self._energy_coul).reshape(
-            (self._batch_size, self._num_atoms)
-        )
-        energy_lj = self._backend.from_gpu(self._energy_lj).reshape(
-            (self._batch_size, self._num_atoms)
-        )
-
-        # Get the water positions.
-        water_positions = self._backend.from_gpu(self._water_positions).reshape(
-            (self._batch_size, self._num_points, 3)
-        )
-
-        # Get the RF acceptance probability.
-        probability = self._backend.from_gpu(self._probability).flatten()
-
-        # Store debugging attributes.
-        self._debug = {
-            "move": "insertion",
-            "idx": idx_water,
-            "energy_coul": self._prefactor * energy_coul[idx].sum(),
-            "energy_lj": energy_lj[idx].sum(),
-            "probability_rf": probability[idx],
-        }
-
-        # Log the position of the inserted oxygen atom.
-        _logger.debug(f"Inserted oxygen position: {water_positions[idx, 0]}")
-
-        # Log the energies of the accepted candidate.
-        _logger.debug(f"RF coulomb energy: {self._debug['energy_coul']:.6f} kcal/mol")
-        _logger.debug(f"LJ energy: {self._debug['energy_lj']:.6f} kcal/mol")
-        _logger.debug(
-            f"Total RF energy difference: {self._debug['energy_coul'] + self._debug['energy_lj']:.6f} kcal/mol"
-        )
-        _logger.debug(f"RF insertion probability: {probability[idx]:.6f}")
-
-        # Add PME energy if available.
-        if pme_energy is not None:
-            self._debug["pme_energy"] = pme_energy.value_in_unit(
-                _openmm.unit.kilocalories_per_mole
-            )
-            self._debug["probability_pme"] = pme_probability
-
-            _logger.debug(
-                f"Total PME energy difference: {self._debug['pme_energy']:.6f} kcal/mol"
-            )
-            _logger.debug(f"PME insertion probability: {pme_probability:.6f}")
-
-    def _log_deletion(
-        self, idx, candidates, positions, pme_energy=None, pme_probability=None
-    ):
-        """
-        Log information about the accepted deletion move.
-
-        Parameters
-        ----------
-
-        idx: int
-            The index of the accepted deletion.
-
-        candidates: numpy.ndarray
-            The indices of the candidate waters.
-
-        positions: numpy.ndarray
-            The positions of the system.
-
-        pme_energy: openmm.Quantity
-            The PME energy difference.
-
-        pme_probability: float
-            The PME acceptance probability.
-        """
-        # Get the coulomb and LJ energies.
-        energy_coul = self._backend.from_gpu(self._energy_coul).reshape(
-            (self._batch_size, self._num_atoms)
-        )
-        energy_lj = self._backend.from_gpu(self._energy_lj).reshape(
-            (self._batch_size, self._num_atoms)
-        )
-
-        # Get the RF acceptance probability.
-        probability = self._backend.from_gpu(self._probability).flatten()
-
-        # Get the water index.
-        idx_water = self._water_indices[candidates[idx]]
-
-        # Store debugging attributes.
-        self._debug = {
-            "move": "deletion",
-            "idx": self._water_indices[candidates[idx]],
-            "energy_coul": -self._prefactor * energy_coul[idx].sum(),
-            "energy_lj": -energy_lj[idx].sum(),
-            "probability_rf": probability[idx],
-        }
-
-        # Log the oxygen position.
-        _logger.debug(f"Deleted oxygen position: {positions[idx_water]}")
-
-        # Log the energies of the accepted candidate.
-        _logger.debug(f"RF coulomb energy: {self._debug['energy_coul']:.6f} kcal/mol")
-        _logger.debug(f"LJ energy: {self._debug['energy_lj']:.6f} kcal/mol")
-        _logger.debug(
-            f"Total RF energy difference: {self._debug['energy_coul'] + self._debug['energy_lj']:.6f} kcal/mol"
-        )
-        _logger.debug(f"RF deletion probability: {probability[idx]:.6f}")
-
-        # Add PME energy if available.
-        if pme_energy is not None:
-            self._debug["pme_energy"] = pme_energy.value_in_unit(
-                _openmm.unit.kilocalories_per_mole
-            )
-            self._debug["probability_pme"] = pme_probability
-
-            _logger.debug(
-                f"Total PME energy difference: {self._debug['pme_energy']:.6f} kcal/mol"
-            )
-            _logger.debug(f"PME deletion probability: {pme_probability:.6f}")
-
-    def _flag_ghost_waters(self, system):
-        """
-        Flag the ghost waters in the system.
-
-        Parameters
-        ----------
-
-        system: sire.system.System
-            The molecular system.
-
-        Returns
-
-        system: sire.system.System
-            The system with the ghost waters flagged.
-        """
-
-        if not isinstance(system, _sr.system.System):
-            raise ValueError("'system' must be a Sire system")
-
-        # Use the Sire atom indices (no vsite offset) so that lookups into the
-        # input topology are correct regardless of virtual sites in the context.
-        ghost_oxygens = self._water_indices_sire[self._get_ghost_waters()]
-
-        # Loop over the ghost waters and set the is_ghost property.
-        for i in ghost_oxygens:
-            cursor = system[system.atoms()[int(i)].molecule()].cursor()
-            cursor["is_ghost_water"] = True
-            system.update(cursor.commit())
-
-        # Return the system.
-        return system

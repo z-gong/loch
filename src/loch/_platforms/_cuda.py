@@ -36,7 +36,7 @@ from .._kernels import code as _kernel_code
 from ._base import PlatformBackend as _PlatformBackend
 
 # Module-level kernel compilation cache. Keyed on
-# (device_index, compiler_optimisations). Since the kernel source no longer
+# (device_index, compiler_optimisations, num_points). Since the kernel source no longer
 # depends on system-specific parameters, the same compiled binary can be
 # reused across all samplers on a given device.
 _kernel_cache = {}
@@ -140,7 +140,7 @@ class CUDAPlatform(_PlatformBackend):
         dict
             Dictionary mapping kernel names to callable kernel functions.
         """
-        cache_key = (self._device_index, self._compiler_optimisations)
+        cache_key = (self._device_index, self._compiler_optimisations, self._num_points)
 
         if cache_key in _kernel_cache:
             cubin = _kernel_cache[cache_key]
@@ -152,7 +152,7 @@ class CUDAPlatform(_PlatformBackend):
             stderr_capture = _io.StringIO()
             old_stderr = _sys.stderr
 
-            options = []
+            options = [f"-DMAX_POINTS={self._num_points}"]
             if self._compiler_optimisations:
                 options.append("--use_fast_math")
 

@@ -58,7 +58,8 @@ code = """
     const float prefactor = 332.0637090025476f;
 
     // Maximum number of atoms per water molecule (for stack array sizing).
-    #define MAX_POINTS 5
+    // #define MAX_POINTS 6
+    // MAX_POINTS is injected at JIT compile time via -DMAX_POINTS=N.
     #define MAX_WATER_POSITIONS (3 * MAX_POINTS)
 
     #ifndef __OPENCL_VERSION__
@@ -377,14 +378,11 @@ code = """
             GLOBAL float* energy_lj,
             GLOBAL int* deletion_candidates,
             GLOBAL int* is_deletion,
-            int is_fep,
             GLOBAL const float* position,
             GLOBAL const float* charge,
             GLOBAL const float* sigma,
             GLOBAL const float* epsilon,
-            GLOBAL const float* alpha,
             GLOBAL const int* is_ghost_water,
-            GLOBAL const int* is_ghost_fep,
             GLOBAL const float* sigma_water,
             GLOBAL const float* epsilon_water,
             GLOBAL const float* charge_water,
@@ -394,11 +392,7 @@ code = """
             float rf_cutoff,
             float rf_kappa,
             float rf_correction,
-            int softcore_form,
-            float sc_shift_coulomb,
-            float sc_shift_delta,
-            int sc_taylor_power,
-            float sc_beutler_alpha)
+            int combining_rule)
         {
             // Work out the atom index.
             const int idx_atom = GET_GLOBAL_ID(0);
@@ -458,17 +452,6 @@ code = """
                     return;
                 }
 
-                // If this an alchemical system, then we need to check whether the
-                // atom is a ghost atom.
-                bool is_ghost_atom = false;
-                if (is_fep == 1)
-                {
-                    if (is_ghost_fep[idx_atom] == 1)
-                    {
-                        is_ghost_atom = true;
-                    }
-                }
-
                 // Get the atom position.
                 float v0[3];
                 v0[0] = position[3 * idx_atom];
@@ -509,94 +492,31 @@ code = """
                     if (r2 < cutoff2)
                     {
                         // Don't divide by zero.
-                        if (!is_fep && r2 < 1e-6)
+                        if (r2 < 1e-6)
                         {
                             energy_coul[idx] = 1e6;
                             energy_lj[idx] = 1e6;
                             return;
                         }
-                        else
-                        {
-                            // Regular non-bonded forces.
-                            if (!is_ghost_atom)
-                            {
-                                // Compute the LJ interaction.
-                                float s1 = sigma_water[i];
-                                const float e1 = epsilon_water[i];
-                                const float s = 0.5f * (s0 + s1);
-                                const float e = sqrtf(e0 * e1);
-                                const float s2 = s * s;
-                                const float sr2 = s2 / r2;
-                                const float sr6 = sr2 * sr2 * sr2;
-                                energy_lj[idx] += 4.0f * e * sr6 * (sr6 - 1.0f);
 
-                                // Compute reciprocal distance (faster than sqrtf).
-                                const float r_inv = rsqrtf(r2);
+                        // Compute the LJ interaction.
+                        const float s1 = sigma_water[i];
+                        const float e1 = epsilon_water[i];
+                        const float s = (combining_rule == 0) ? 0.5f * (s0 + s1) : sqrtf(s0 * s1);
+                        const float e = sqrtf(e0 * e1);
+                        const float s2 = s * s;
+                        const float sr2 = s2 / r2;
+                        const float sr6 = sr2 * sr2 * sr2;
+                        energy_lj[idx] += 4.0f * e * sr6 * (sr6 - 1.0f);
 
-                                // Store the charge on the water atom.
-                                const float q1 = charge_water[i];
+                        // Compute reciprocal distance (faster than sqrtf).
+                        const float r_inv = rsqrtf(r2);
 
-                                // Add the reaction field pair energy.
-                                energy_coul[idx] += (q0 * q1) * (r_inv + (rf_kappa * r2) - rf_correction);
-                            }
+                        // Store the charge on the water atom.
+                        const float q1 = charge_water[i];
 
-                            // Soft-core potential for ghost atoms.
-                            else
-                            {
-                                // Store required parameters.
-                                const float q1 = charge_water[i];
-                                const float s1 = sigma_water[i];
-                                const float e1 = epsilon_water[i];
-                                const float s = 0.5f * (s0 + s1);
-                                const float e = sqrtf(e0 * e1);
-                                const float a = alpha[idx_atom];
-
-                                // Clamp r2 to avoid singularities.
-                                const float r2_sc = (r2 < 1e-6f) ? 1e-6f : r2;
-
-                                // Precompute r^6 and sigma^6 using r2 directly (avoids sqrtf and powf).
-                                const float r6 = r2_sc * r2_sc * r2_sc;
-                                const float s2 = s * s;
-                                const float s6_val = s2 * s2 * s2;
-
-                                // Compute the LJ interaction using the chosen soft-core form.
-                                float sig6;
-                                float lj_prefactor = 1.0f;
-                                if (softcore_form == 1)
-                                {
-                                    // Taylor soft-core LJ:
-                                    //   sig6 = sigma^6 / (alpha^m * sigma^6 + r^6)
-                                    const float alpha_m = (sc_taylor_power == 1) ? a
-                                        : (sc_taylor_power == 0) ? 1.0f
-                                        : powf(a, (float)sc_taylor_power);
-                                    sig6 = s6_val / (alpha_m * s6_val + r6);
-                                }
-                                else if (softcore_form == 2)
-                                {
-                                    // Beutler soft-core LJ:
-                                    //   sig6 = sigma^6 / (sc_beutler_alpha * sigma^6 * alpha + r^6)
-                                    //   V_LJ = (1 - alpha) * 4 * epsilon * sig6 * (sig6 - 1)
-                                    sig6 = s6_val / (sc_beutler_alpha * s6_val * a + r6);
-                                    lj_prefactor = 1.0f - a;
-                                }
-                                else
-                                {
-                                    // Zacharias soft-core LJ:
-                                    //   sig6 = sigma^6 / (sigma*delta + r^2)^3
-                                    //   delta = shift_delta * alpha
-                                    const float delta_lj = sc_shift_delta * a;
-                                    const float denom = (s * delta_lj) + r2_sc;
-                                    sig6 = s6_val / (denom * denom * denom);
-                                }
-                                energy_lj[idx] += lj_prefactor * 4.0f * e * sig6 * (sig6 - 1.0f);
-
-                                // Compute the Coulomb interaction.
-                                energy_coul[idx] += (q0 * q1) *
-                                    ((1.0f / sqrtf((sc_shift_coulomb * sc_shift_coulomb * a)
-                                    + r2_sc)) + (rf_kappa * r2) - rf_correction);
-
-                            }
-                        }
+                        // Add the reaction field pair energy.
+                        energy_coul[idx] += (q0 * q1) * (r_inv + (rf_kappa * r2) - rf_correction);
                     }
                 }
             }

@@ -42,8 +42,11 @@ class BatchRandoms:
     rotation : numpy.ndarray
         Shape (batch_size, 3) array of uniform [0,1) randoms for water rotation.
 
+    direction : numpy.ndarray
+        Shape (batch_size, 3) array of normal randoms for sphere direction vector.
+
     position : numpy.ndarray
-        Shape (batch_size, 3) array of normal randoms for position direction.
+        Shape (batch_size, 3) array of uniform [0,1) randoms for fractional coords (bulk mode).
 
     radius : numpy.ndarray
         Shape (batch_size,) array of uniform [0,1) randoms for radial distance.
@@ -53,6 +56,7 @@ class BatchRandoms:
     """
 
     rotation: _np.ndarray
+    direction: _np.ndarray
     position: _np.ndarray
     radius: _np.ndarray
     acceptance: _np.ndarray
@@ -101,7 +105,10 @@ class RNGManager:
             rotation=self._rng.uniform(0, 1, size=(self._batch_size, 3)).astype(
                 _np.float32
             ),
-            position=self._rng.normal(0, 1, size=(self._batch_size, 3)).astype(
+            direction=self._rng.normal(0, 1, size=(self._batch_size, 3)).astype(
+                _np.float32
+            ),
+            position=self._rng.uniform(0, 1, size=(self._batch_size, 3)).astype(
                 _np.float32
             ),
             radius=self._rng.uniform(0, 1, size=self._batch_size).astype(_np.float32),

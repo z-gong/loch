@@ -1,0 +1,10 @@
+channels:
+  - conda-forge
+dependencies:
+  - cuda-version>=12.0
+  - openmm>=8.1.2
+  - z-gong::mstk>=0.4.0
+  - pycuda
+  - cuda-nvcc
+  - click
+  - pytest
