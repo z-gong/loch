@@ -158,7 +158,7 @@ def run_gcmc(top_file, conf_file, ff_file, resname, mu, vol,
             write_state(i + 1)
 
         if i == 0 or (i + 1) % 10 == 0 or i == cycle - 1:
-            n_w = sampler.num_waters(sim.context)
+            n_w = sampler.num_waters()
             box_vol = np.prod(sampler.box_size)
             density = (non_gcmc_mass + n_w * gcmc_mol_mass) / (box_vol * 602.214)
             logger.info(f'Cycle {i + 1:4d} | N={n_w:4d} | ρ={density:.4f} | V={box_vol:.2f} | '
@@ -174,7 +174,7 @@ def run_gcmc(top_file, conf_file, ff_file, resname, mu, vol,
         if sampler.ghost_exhausted:
             break
 
-    logger.info(f'Done. Final N={sampler.num_waters(sim.context)}, '
+    logger.info(f'Done. Final N={sampler.num_waters()}, '
                 f'acceptance_ratio={sampler.move_acceptance_probability():.1e}')
 
     # Write final state with only real atoms.

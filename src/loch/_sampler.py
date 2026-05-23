@@ -464,30 +464,100 @@ class GCMCSampler:
         self._gpu_M = self._backend.to_gpu(M)
 
 
-    def num_waters(self, context=None) -> int:
-        """Return the number of real (non-ghost) molecules in the GCMC region."""
-        if self._reference_indices is None:
-            return int(_np.sum(self._water_state == 1))
+    def delete_waters(self, context: _openmm.Context) -> None:
+        """
+        Delete any waters within the GCMC sphere. (Convert to ghosts.)
 
-        # After a bulk move, _N reflects box count not sphere count — recompute.
-        if context is None and self._is_bulk:
-            context = self._openmm_context
+        Parameters
+        ----------
 
-        if context is not None:
-            # Recompute _N by running deletion kernel on current positions.
-            state = context.getState(getPositions=True)
+        context: openmm.Context
+            The OpenMM context to use.
+        """
+        # Get the OpenMM state.
+        state = context.getState(getPositions=True)
+
+        # Get the current positions in Angstrom.
+        positions = state.getPositions(asNumpy=True) / _openmm.unit.angstrom
+
+        # Get the position of the GCMC sphere centre.
+        target = self._backend.to_gpu(
+            self._get_target_position(positions).astype(_np.float32)
+        )
+
+        # Upload atom positions to GPU.
+        self._gpu_position = self._backend.to_gpu(_as_float32(positions).flatten())
+
+        # Find the non-ghost waters within the GCMC region.
+        self._kernels["deletion"](
+            _np.int32(self._num_waters),
+            self._deletion_candidates,
+            self._backend.to_gpu(target.astype(_np.float32)),
+            _np.float32(self._radius * 10.0),  # nm → Å
+            self._gpu_position,
+            self._gpu_water_idx,
+            self._gpu_water_state,
+            self._gpu_cell_matrix_inverse,
+            self._gpu_M,
+            block=(self._num_threads, 1, 1),
+            grid=(self._water_blocks, 1, 1),
+        )
+
+        # Get the candidates.
+        candidates = self._backend.from_gpu(self._deletion_candidates).flatten()
+
+        # Find the waters within the GCMC sphere.
+        candidates = _np.where(candidates == 1)[0]
+
+        _logger.info(f"Deleting {len(candidates)} waters from the GCMC sphere")
+
+        # Loop over the candidates and delete them.
+        for idx in candidates:
+            self._accept_deletion(idx, context)
+
+        # Set the number of waters in the GCMC sphere to zero.
+        self._N = 0
+
+
+    def num_waters(self) -> int:
+        """
+        Return the number of waters in the GCMC region.
+
+        Returns
+        -------
+
+        num_waters: int
+            The number of waters.
+        """
+
+        # The last move was a bulk sampling move, so we need to recalculate
+        # the number of waters in the GCMC sphere.
+        if self._reference_indices is not None and self._is_bulk:
+            if not self._openmm_context:
+                msg = "OpenMM context is not set!"
+                _logger.error(msg)
+                raise RuntimeError(msg)
+
+            # Get the OpenMM state.
+            state = self._openmm_context.getState(getPositions=True)
+
+            # Get the current positions in Angstrom.
             positions = state.getPositions(asNumpy=True) / _openmm.unit.angstrom
 
+            # Get the position of the GCMC sphere centre.
             target = self._backend.to_gpu(
                 self._get_target_position(positions).astype(_np.float32)
             )
+
+            # Upload atom positions to GPU.
             self._gpu_position = self._backend.to_gpu(_as_float32(positions).flatten())
 
+            # Find the non-ghost waters within the GCMC region.
             self._kernels["deletion"](
                 _np.int32(self._num_waters),
                 self._deletion_candidates,
-                target,
-                _np.float32(self._radius * 10.0),
+                self._backend.to_gpu(target.astype(_np.float32)),
+                _np.float32(self._radius * 10.0),  # nm → Å
                 self._gpu_position,
                 self._gpu_water_idx,
                 self._gpu_water_state,
@@ -497,11 +567,18 @@ class GCMCSampler:
                 grid=(self._water_blocks, 1, 1),
             )
 
+            # Get the candidates.
             candidates = self._backend.from_gpu(self._deletion_candidates).flatten()
-            self._N = int(_np.sum(candidates == 1))
+
+            # Find the waters within the GCMC sphere.
+            candidates = _np.where(candidates == 1)[0]
+
+            # Set the number of waters.
+            self._N = len(candidates)
+
+            # Reset the bulk sampling flag.
             self._is_bulk = False
 
-        # If last move was sphere-targeted, _N is already up to date.
         return self._N
 
 
